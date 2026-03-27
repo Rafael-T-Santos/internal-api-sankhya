@@ -1,5 +1,5 @@
 # Usa uma imagem leve do Python
-FROM python:3.9-slim
+FROM python:3.9-slim-bullseye
 
 # Instala as dependências do sistema e o Oracle Instant Client (necessário para cx_Oracle)
 WORKDIR /opt/oracle
