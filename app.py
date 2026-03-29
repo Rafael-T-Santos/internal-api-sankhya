@@ -584,7 +584,10 @@ def consultar_ordem_carga():
             vei.placa,
             motorista.codparc AS codparc_motorista,
             motorista.nomeparc AS nome_motorista,
-            top.descroper
+            top.descroper,
+            ord.ad_doca AS doca,
+            ord.horasaida AS horasaida,
+            ord.seqcarga as seqcarga
         FROM tgfcab cab
         LEFT JOIN tsiemp emp
                ON emp.codemp = cab.codemp
