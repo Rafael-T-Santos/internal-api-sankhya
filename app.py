@@ -663,7 +663,10 @@ def consultar_ordem_carga():
         i.qtdneg,
         i.qtdvol,
         i.vlrtot,
-        b.descroper
+        b.descroper,
+        b.doca,
+        b.horasaida,
+        b.seqcarga
     FROM base b
     LEFT JOIN itens i
            ON i.nunota = b.nunota
