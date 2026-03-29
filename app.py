@@ -724,7 +724,11 @@ def consultar_ordem_carga():
                 "qtdNeg": float(row[20]) if row[20] is not None else 0.0,
                 "qtdVol": float(row[21]) if row[21] is not None else 0.0,
                 "vlrTot": float(row[22]) if row[22] is not None else 0.0,
-                "descrOper": row[23]
+                "descrOper": row[23],
+                "doca": row[24],
+                "horaSaida": row[25].strftime('%Y-%m-%d %H:%M:%S') if row[25] else None, 
+                "seqCarga": row[26]
+
             })
 
         return jsonify({
