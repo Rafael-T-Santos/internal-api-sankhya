@@ -767,7 +767,7 @@ def consultar_cliente():
         LEFT JOIN tsiufs e ON b.uf = e.coduf
         WHERE a.codparc = (
             SELECT codparc FROM tgfcab
-            WHERE numnota = :numnota
+            WHERE nunota = :numnota
             AND ROWNUM = 1
         )
     """
