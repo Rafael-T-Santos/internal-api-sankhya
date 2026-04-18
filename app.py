@@ -746,3 +746,64 @@ def consultar_ordem_carga():
     finally:
         if conexao:
             conexao.close()
+
+
+@app.route('/api/consultar-cliente', methods=['POST'])
+def consultar_cliente():
+    dados = request.get_json()
+    if not dados or 'numnota' not in dados:
+        return jsonify({"erro": "Campo 'numnota' é obrigatório"}), 400
+
+    numnota = dados['numnota']
+    conexao = None
+
+    sql = """
+        SELECT a.codparc, a.nomeparc, a.razaosocial, b.nomecid, e.uf,
+               c.nomeend, a.numend, d.nomebai
+        FROM tgfpar a
+        LEFT JOIN tsicid b ON a.codcid = b.codcid
+        LEFT JOIN tsiend c ON a.codend = c.codend
+        LEFT JOIN tsibai d ON a.codbai = d.codbai
+        LEFT JOIN tsiufs e ON b.uf = e.coduf
+        WHERE a.codparc = (
+            SELECT codparc FROM tgfcab
+            WHERE numnota = :numnota
+            AND ROWNUM = 1
+        )
+    """
+
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha ao conectar ao banco de dados"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql, {"numnota": numnota})
+        row = cursor.fetchone()
+
+        if not row:
+            return jsonify({"erro": "Cliente não encontrado para a nota informada"}), 404
+
+        return jsonify({
+            "sucesso": True,
+            "dados": {
+                "codparc": row[0],
+                "nomeparc": row[1],
+                "razaosocial": row[2],
+                "nomecid": row[3],
+                "uf": row[4],
+                "nomeend": row[5],
+                "numend": str(row[6]) if row[6] is not None else None,
+                "nomebai": row[7]
+            }
+        })
+
+    except cx_Oracle.Error as err:
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
