@@ -863,8 +863,9 @@ def itens_contagem():
         return jsonify({"erro": "Parâmetro 'nuContagem' é obrigatório."}), 400
 
     sql = """
-    SELECT *
+    SELECT I.*, P.AD_REFERENCIA2, P.AD_VALIDABARRA
     FROM AD_CONTAGEMMARCAITE I
+    LEFT JOIN TGFPRO P ON P.CODPROD = I.CODPROD
     WHERE I.VALIDACONTAGEM = 'S'
       AND I.NUCONTAGEM = :NUCONTAGEM
       AND EXISTS (
