@@ -816,9 +816,10 @@ def consultar_cliente():
 @app.route("/api/contagens-pendentes", methods=["GET"])
 def contagens_pendentes():
     sql = """
-    SELECT *
-    FROM AD_CONTAGEMMARCA
-    WHERE NVL(PROCESSADO, 'N') = 'N'
+    SELECT A.*, B.DESCRICAO AS DESCRICAO_MARCA
+    FROM AD_CONTAGEMMARCA A
+    LEFT JOIN TGFMAR B ON A.CODIGO = B.CODIGO
+    WHERE NVL(A.PROCESSADO, 'N') = 'N'
     """
 
     conexao = None
