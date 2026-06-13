@@ -811,3 +811,93 @@ def consultar_cliente():
     finally:
         if conexao:
             conexao.close()
+
+
+@app.route("/api/contagens-pendentes", methods=["GET"])
+def contagens_pendentes():
+    sql = """
+    SELECT *
+    FROM AD_CONTAGEMMARCA
+    WHERE NVL(PROCESSADO, 'N') = 'N'
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql)
+        colunas = [col[0].lower() for col in cursor.description]
+        resultados = cursor.fetchall()
+
+        dados = [dict(zip(colunas, row)) for row in resultados]
+
+        return jsonify({
+            "sucesso": True,
+            "totalRegistros": len(dados),
+            "dados": dados
+        })
+
+    except cx_Oracle.Error as err:
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@app.route("/api/itens-contagem", methods=["POST"])
+def itens_contagem():
+    data = request.get_json()
+    if not data:
+        return jsonify({"erro": "Nenhum dado recebido"}), 400
+
+    nu_contagem = data.get("nuContagem")
+    if not nu_contagem:
+        return jsonify({"erro": "Parâmetro 'nuContagem' é obrigatório."}), 400
+
+    sql = """
+    SELECT *
+    FROM AD_CONTAGEMMARCAITE I
+    WHERE I.VALIDACONTAGEM = 'S'
+      AND I.NUCONTAGEM = :NUCONTAGEM
+      AND EXISTS (
+            SELECT 1
+            FROM AD_CONTAGEMMARCA C
+            WHERE C.NUCONTAGEM = I.NUCONTAGEM
+          )
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql, {"NUCONTAGEM": nu_contagem})
+        colunas = [col[0].lower() for col in cursor.description]
+        resultados = cursor.fetchall()
+
+        dados = [dict(zip(colunas, row)) for row in resultados]
+
+        return jsonify({
+            "sucesso": True,
+            "totalRegistros": len(dados),
+            "dados": dados
+        })
+
+    except cx_Oracle.Error as err:
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
