@@ -902,3 +902,81 @@ def itens_contagem():
     finally:
         if conexao:
             conexao.close()
+
+
+@app.route("/api/registrar-contagem", methods=["POST"])
+def registrar_contagem():
+    data = request.get_json()
+    if not data:
+        return jsonify({"erro": "Nenhum dado recebido"}), 400
+
+    nu_contagem = data.get("nuContagem")
+    itens = data.get("itens", [])
+
+    if not nu_contagem:
+        return jsonify({"erro": "Parâmetro 'nuContagem' é obrigatório."}), 400
+    if not itens:
+        return jsonify({"erro": "Parâmetro 'itens' é obrigatório e não pode ser vazio."}), 400
+
+    for i, item in enumerate(itens):
+        if item.get("codProd") is None or item.get("estoqueContagem") is None:
+            return jsonify({"erro": f"Item na posição {i} deve conter 'codProd' e 'estoqueContagem'."}), 400
+
+    sql_item = """
+    UPDATE AD_CONTAGEMMARCAITE
+    SET ESTOQUECONTAGEM = :ESTOQUECONTAGEM
+    WHERE NUCONTAGEM = :NUCONTAGEM
+      AND CODPROD = :CODPROD
+    """
+
+    sql_processado = """
+    UPDATE AD_CONTAGEMMARCA
+    SET PROCESSADO = 'S'
+    WHERE NUCONTAGEM = :NUCONTAGEM
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+
+        nao_encontrados = []
+        for item in itens:
+            cursor.execute(sql_item, {
+                "ESTOQUECONTAGEM": item["estoqueContagem"],
+                "NUCONTAGEM": nu_contagem,
+                "CODPROD": item["codProd"]
+            })
+            if cursor.rowcount == 0:
+                nao_encontrados.append(item["codProd"])
+
+        if nao_encontrados:
+            conexao.rollback()
+            return jsonify({
+                "erro": f"Produtos não encontrados na contagem {nu_contagem}: {nao_encontrados}. Nenhuma alteração foi salva."
+            }), 404
+
+        cursor.execute(sql_processado, {"NUCONTAGEM": nu_contagem})
+        conexao.commit()
+
+        return jsonify({
+            "sucesso": True,
+            "mensagem": f"{len(itens)} item(ns) registrado(s) e contagem {nu_contagem} marcada como processada."
+        })
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
