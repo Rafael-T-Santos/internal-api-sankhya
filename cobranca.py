@@ -20,6 +20,36 @@ def _erro(err, codigo=500):
     return jsonify({"erro": str(err)}), codigo
 
 
+def _txt(valor):
+    """Texto do banco: espaços em branco viram None.
+
+    Campos como TGFPAR.EMAIL vêm preenchidos com espaços ("  ") em vez de NULL.
+    Uma string dessas é "verdadeira" em JS e o front acabaria exibindo um campo
+    vazio em vez de "sem e-mail".
+    """
+    if valor is None:
+        return None
+    limpo = str(valor).strip()
+    return limpo or None
+
+
+# ---------------------------------------------------------------------------
+# RECDESP: por que IN (0, 1) e não = 1
+#
+# Nesta base, RECEITA de cliente aparece com RECDESP 0 E 1 — os dois. Só o -1 é
+# despesa (compra, folha, tributos, adiantamento a fornecedor).
+#
+# Levantamento em 2026-07-13 (títulos em aberto, tipos 2/3/4/5/39):
+#   -1 →    811 títulos — despesa. FORA.
+#    0 → 32.019 títulos — 99,9% venda (VENDA GERENCIAL, VENDA NF-E - BOLETO,
+#         RECEITA DO SISTEMA ANTERIOR). Inclui 185 CHEQUES DEVOLVIDOS (R$ 884 mil).
+#    1 →  8.497 títulos — venda também.
+#
+# Filtrar RECDESP = 1 (como fazia o relatório de origem) escondia o grupo 0
+# inteiro. Havia ~19 títulos de natureza despesa dentro do grupo 0 e ~60 dentro
+# do 1 (comissão, folha): ruído < 0,1%, e o do grupo 1 já estava em produção.
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # Regra de cheques (pendentes e devolvidos)
 #
@@ -58,7 +88,7 @@ CHQ_NORMAL AS (
     JOIN TGFCHQ CHQ ON CHQ.NUFIN = FIN.NUFIN
     JOIN ULT_EVENTO ULT ON ULT.NUCHQ = CHQ.NUCHQ AND ULT.RN = 1
     WHERE FIN.CODTIPTIT = 3
-      AND FIN.RECDESP = 1
+      AND FIN.RECDESP IN (0, 1)
       AND NVL(FIN.PROVISAO, 'N') = 'N'
       AND FIN.AD_ACERTADO = 'N'
       AND NVL(FIN.CODTIPOPER, 0) <> 1657
@@ -96,7 +126,7 @@ CHQ_NORMAL AS (
       AND NOT EXISTS (
           SELECT 1 FROM TGFFIN DEV
           WHERE DEV.CODPARC = FIN.CODPARC
-            AND DEV.RECDESP = 1
+            AND DEV.RECDESP IN (0, 1)
             AND DEV.CODTIPOPER = 1657
             AND NVL(DEV.PROVISAO, 'N') = 'N'
             AND (
@@ -137,7 +167,7 @@ DEV_1657 AS (
         'Devolução' AS ULTIMO_EVENTO_REGRA
     FROM TGFFIN FIN
     WHERE FIN.CODTIPTIT = 3
-      AND FIN.RECDESP = 1
+      AND FIN.RECDESP IN (0, 1)
       AND NVL(FIN.PROVISAO, 'N') = 'N'
       AND FIN.AD_ACERTADO = 'N'
       AND FIN.CODTIPOPER = 1657
@@ -307,7 +337,7 @@ SELECT
     FIN.DESDOBRAMENTO,
     FIN.NOMEEMITENTE_CMC7
 {JOINS_TITULO}
-WHERE FIN.RECDESP = 1
+WHERE FIN.RECDESP IN (0, 1)
   AND FIN.CODTIPTIT IN (2, 3, 4, 5, 39)
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND (
@@ -451,7 +481,7 @@ SELECT
     SUM(CASE WHEN TRUNC(FIN.DHBAIXA) <= TRUNC(FIN.DTVENC) THEN 1 ELSE 0 END) AS EM_DIA
 FROM TGFFIN FIN
 WHERE FIN.CODPARC = :CODPARC
-  AND FIN.RECDESP = 1
+  AND FIN.RECDESP IN (0, 1)
   AND FIN.DHBAIXA IS NOT NULL
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND FIN.DHBAIXA >= ADD_MONTHS(TRUNC(SYSDATE), -12)
@@ -485,7 +515,7 @@ SELECT
     END AS SITUACAO
 {JOINS_TITULO}
 WHERE FIN.CODPARC = :CODPARC
-  AND FIN.RECDESP = 1
+  AND FIN.RECDESP IN (0, 1)
   AND FIN.CODTIPTIT IN (2, 3, 4, 5, 39)
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND (
@@ -527,16 +557,16 @@ def cliente():
             "sucesso": True,
             "dados": {
                 "codParc":       row[0],
-                "nomeParc":      row[1],
-                "razaoSocial":   row[2],
-                "cgcCpf":        row[3],
-                "telefone":      row[4],
-                "email":         row[5],
+                "nomeParc":      _txt(row[1]),
+                "razaoSocial":   _txt(row[2]),
+                "cgcCpf":        _txt(row[3]),
+                "telefone":      _txt(row[4]),
+                "email":         _txt(row[5]),
                 "limiteCredito": float(row[6]) if row[6] is not None else 0.0,
                 "ativo":         row[7],
-                "nomeCid":       row[8],
-                "uf":            row[9],
-                "vendedor":      row[10],
+                "nomeCid":       _txt(row[8]),
+                "uf":            _txt(row[9]),
+                "vendedor":      _txt(row[10]),
                 # null quando não há histórico: o front mostra "sem histórico",
                 # em vez de fingir que 0% de pontualidade é um fato.
                 "pontualidade": round(em_dia * 100.0 / quitados, 1) if quitados else None,
