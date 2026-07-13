@@ -18,8 +18,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia o código da sua API
-COPY app.py .
+# Copia o código da sua API (app.py + db.py + módulos por domínio, ex.: cobranca.py)
+COPY *.py ./
 
 # Expõe a porta 5000 (padrão do Flask)
 EXPOSE 5000
