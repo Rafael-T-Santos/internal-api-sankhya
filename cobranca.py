@@ -34,20 +34,19 @@ def _txt(valor):
 
 
 # ---------------------------------------------------------------------------
-# RECDESP: por que IN (0, 1) e não = 1
+# RECDESP: por que = 1, e NUNCA 0
 #
-# Nesta base, RECEITA de cliente aparece com RECDESP 0 E 1 — os dois. Só o -1 é
-# despesa (compra, folha, tributos, adiantamento a fornecedor).
+# RECDESP não é "receita vs. despesa" como o nome sugere:
+#    1 → título ATIVO de receita. É o que a cobrança persegue.
+#    0 → título NEUTRALIZADO: a origem de uma renegociação. Já foi substituído
+#        por outro(s) título(s) e NÃO é mais dívida. Nunca tem baixa, por isso
+#        parece "vencido para sempre".
+#   -1 → despesa (compra, folha, tributos).
 #
-# Levantamento em 2026-07-13 (títulos em aberto, tipos 2/3/4/5/39):
-#   -1 →    811 títulos — despesa. FORA.
-#    0 → 32.019 títulos — 99,9% venda (VENDA GERENCIAL, VENDA NF-E - BOLETO,
-#         RECEITA DO SISTEMA ANTERIOR). Inclui 185 CHEQUES DEVOLVIDOS (R$ 884 mil).
-#    1 →  8.497 títulos — venda também.
-#
-# Filtrar RECDESP = 1 (como fazia o relatório de origem) escondia o grupo 0
-# inteiro. Havia ~19 títulos de natureza despesa dentro do grupo 0 e ~60 dentro
-# do 1 (comissão, folha): ruído < 0,1%, e o do grupo 1 já estava em produção.
+# Confirmado com o responsável pela cobrança em 2026-07-13. Incluir o 0 conta a
+# mesma dívida DUAS VEZES (o título velho renegociado + o novo que o substituiu):
+# chegamos a inflar a carteira em R$ 4,1 milhões de "VENDA GERENCIAL - A VISTA"
+# que já estavam renegociados. NÃO reabrir o filtro para 0.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -88,7 +87,7 @@ CHQ_NORMAL AS (
     JOIN TGFCHQ CHQ ON CHQ.NUFIN = FIN.NUFIN
     JOIN ULT_EVENTO ULT ON ULT.NUCHQ = CHQ.NUCHQ AND ULT.RN = 1
     WHERE FIN.CODTIPTIT = 3
-      AND FIN.RECDESP IN (0, 1)
+      AND FIN.RECDESP = 1
       AND NVL(FIN.PROVISAO, 'N') = 'N'
       AND FIN.AD_ACERTADO = 'N'
       AND NVL(FIN.CODTIPOPER, 0) <> 1657
@@ -126,7 +125,7 @@ CHQ_NORMAL AS (
       AND NOT EXISTS (
           SELECT 1 FROM TGFFIN DEV
           WHERE DEV.CODPARC = FIN.CODPARC
-            AND DEV.RECDESP IN (0, 1)
+            AND DEV.RECDESP = 1
             AND DEV.CODTIPOPER = 1657
             AND NVL(DEV.PROVISAO, 'N') = 'N'
             AND (
@@ -167,7 +166,7 @@ DEV_1657 AS (
         'Devolução' AS ULTIMO_EVENTO_REGRA
     FROM TGFFIN FIN
     WHERE FIN.CODTIPTIT = 3
-      AND FIN.RECDESP IN (0, 1)
+      AND FIN.RECDESP = 1
       AND NVL(FIN.PROVISAO, 'N') = 'N'
       AND FIN.AD_ACERTADO = 'N'
       AND FIN.CODTIPOPER = 1657
@@ -319,10 +318,13 @@ SELECT
     CASE
         WHEN FIN.CODTIPTIT = 3 AND CHR.STATUS_REGRA = 'P' THEN 'CHEQUE PENDENTE'
         WHEN FIN.CODTIPTIT = 3 AND CHR.STATUS_REGRA = 'D' THEN 'CHEQUE DEVOLVIDO'
+        WHEN FIN.CODTIPTIT <> 3 AND FIN.NURENEG IS NOT NULL
+            THEN 'TÍTULO RENEGOCIADO VENCIDO SEM PAGAMENTO'
         WHEN FIN.CODTIPTIT IN (2, 4, 5, 39)               THEN 'TÍTULO VENCIDO SEM PAGAMENTO'
     END AS SITUACAO,
     CASE WHEN FIN.CODTIPTIT = 3 THEN CHR.ULTIMO_EVENTO_REGRA END AS ULTIMO_EVENTO,
     CASE WHEN FIN.CODTIPTIT = 3 THEN CHR.ORIGEM_REGRA END       AS ORIGEM_REGRA,
+    FIN.NURENEG,
     NVL(FIN.VLRDESC, 0),
     CASE
         WHEN LENGTH(REGEXP_REPLACE(PAR.CGC_CPF, '[^0-9]', '')) = 14 THEN
@@ -342,13 +344,23 @@ SELECT
     FIN.CODTIPOPER,
     TOP.DESCROPER
 {JOINS_TITULO}
-WHERE FIN.RECDESP IN (0, 1)
-  AND FIN.CODTIPTIT IN (2, 3, 4, 5, 39)
+WHERE FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND (
+        /* Títulos normais de cobrança. */
         (FIN.CODTIPTIT IN (2, 4, 5, 39) AND FIN.DHBAIXA IS NULL AND FIN.DTVENC < TRUNC(SYSDATE))
         OR
+        /* Cheques: só os aprovados pela regra do relatório. */
         (FIN.CODTIPTIT = 3 AND CHR.NUFIN IS NOT NULL)
+        OR
+        /* Título ATIVO gerado por renegociação: pode ter tipo fora da lista
+           (PIX, cartão...). O título de ORIGEM não entra — ele é RECDESP = 0. */
+        (
+            FIN.CODTIPTIT NOT IN (2, 3, 4, 5, 39)
+            AND FIN.NURENEG IS NOT NULL
+            AND FIN.DHBAIXA IS NULL
+            AND FIN.DTVENC < TRUNC(SYSDATE)
+        )
       )
 """
 
@@ -433,18 +445,19 @@ def receitas_vencidas():
                 "situacao":      row[23],
                 "ultimoEvento":  row[24],
                 "origemRegra":   row[25],
-                "vlrDesconto":   float(row[26]) if row[26] is not None else 0.0,
-                "cnpjCpf":       row[27],
-                "vlrJuros":      float(row[28]) if row[28] is not None else 0.0,
-                "atrasoDias":    int(row[29]) if row[29] is not None else 0,
-                "vendedor":      row[30],
-                "codObsPadrao":  row[31],
-                "observacao":    row[32],
-                "desdobramento": row[33],
-                "nomeEmitente":  row[34],
-                "recDesp":       row[35],
-                "codTipOper":    row[36],
-                "operacao":      _txt(row[37]),
+                "nuReneg":       row[26],
+                "vlrDesconto":   float(row[27]) if row[27] is not None else 0.0,
+                "cnpjCpf":       row[28],
+                "vlrJuros":      float(row[29]) if row[29] is not None else 0.0,
+                "atrasoDias":    int(row[30]) if row[30] is not None else 0,
+                "vendedor":      row[31],
+                "codObsPadrao":  row[32],
+                "observacao":    row[33],
+                "desdobramento": row[34],
+                "nomeEmitente":  row[35],
+                "recDesp":       row[36],
+                "codTipOper":    row[37],
+                "operacao":      _txt(row[38]),
             })
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
@@ -489,7 +502,7 @@ SELECT
     SUM(CASE WHEN TRUNC(FIN.DHBAIXA) <= TRUNC(FIN.DTVENC) THEN 1 ELSE 0 END) AS EM_DIA
 FROM TGFFIN FIN
 WHERE FIN.CODPARC = :CODPARC
-  AND FIN.RECDESP IN (0, 1)
+  AND FIN.RECDESP = 1
   AND FIN.DHBAIXA IS NOT NULL
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND FIN.DHBAIXA >= ADD_MONTHS(TRUNC(SYSDATE), -12)
@@ -521,16 +534,24 @@ SELECT
         WHEN TRUNC({DT_EFETIVA}) < TRUNC(SYSDATE) THEN 'VENCIDO'
         ELSE 'A_VENCER'
     END AS SITUACAO,
-    TOP.DESCROPER
+    TOP.DESCROPER,
+    FIN.NURENEG
 {JOINS_TITULO}
 WHERE FIN.CODPARC = :CODPARC
-  AND FIN.RECDESP IN (0, 1)
-  AND FIN.CODTIPTIT IN (2, 3, 4, 5, 39)
+  AND FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND (
         (FIN.CODTIPTIT IN (2, 4, 5, 39) AND FIN.DHBAIXA IS NULL)
         OR
         (FIN.CODTIPTIT = 3 AND CHR.NUFIN IS NOT NULL)
+        OR
+        /* Título ativo gerado por renegociação (PIX, cartão...). Sem o corte de
+           vencimento: aqui a 360° também mostra o que ainda está por vencer. */
+        (
+            FIN.CODTIPTIT NOT IN (2, 3, 4, 5, 39)
+            AND FIN.NURENEG IS NOT NULL
+            AND FIN.DHBAIXA IS NULL
+        )
       )
 ORDER BY {DT_EFETIVA}, FIN.NUFIN
 """
@@ -631,6 +652,7 @@ def extrato():
                 "atrasoDias":    int(r[16]) if r[16] is not None else 0,
                 "situacao":      r[17],
                 "operacao":      _txt(r[18]),
+                "nuReneg":       r[19],
             })
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
