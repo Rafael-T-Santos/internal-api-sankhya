@@ -4,3 +4,6 @@
 # Ignorar cache do Python
 __pycache__/
 *.pyc
+
+# Notas/consultas de referência (não vão para o servidor)
+docs/
