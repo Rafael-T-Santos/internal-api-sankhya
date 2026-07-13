@@ -211,6 +211,8 @@ JOINS_TITULO = """
         LEFT JOIN TGFOBS OBS   ON OBS.CODOBSPADRAO = FIN.CODOBSPADRAO
         LEFT JOIN VGFFIN VFIN  ON VFIN.NUFIN       = FIN.NUFIN
         LEFT JOIN CHEQUES_REGRA CHR ON CHR.NUFIN   = FIN.NUFIN
+        LEFT JOIN TGFTOP TOP   ON TOP.CODTIPOPER   = FIN.CODTIPOPER
+                              AND TOP.DHALTER      = FIN.DHTIPOPER
 """
 
 
@@ -335,7 +337,10 @@ SELECT
     FIN.CODOBSPADRAO,
     OBS.OBSERVACAO,
     FIN.DESDOBRAMENTO,
-    FIN.NOMEEMITENTE_CMC7
+    FIN.NOMEEMITENTE_CMC7,
+    FIN.RECDESP,
+    FIN.CODTIPOPER,
+    TOP.DESCROPER
 {JOINS_TITULO}
 WHERE FIN.RECDESP IN (0, 1)
   AND FIN.CODTIPTIT IN (2, 3, 4, 5, 39)
@@ -437,6 +442,9 @@ def receitas_vencidas():
                 "observacao":    row[32],
                 "desdobramento": row[33],
                 "nomeEmitente":  row[34],
+                "recDesp":       row[35],
+                "codTipOper":    row[36],
+                "operacao":      _txt(row[37]),
             })
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
@@ -512,7 +520,8 @@ SELECT
     CASE
         WHEN TRUNC({DT_EFETIVA}) < TRUNC(SYSDATE) THEN 'VENCIDO'
         ELSE 'A_VENCER'
-    END AS SITUACAO
+    END AS SITUACAO,
+    TOP.DESCROPER
 {JOINS_TITULO}
 WHERE FIN.CODPARC = :CODPARC
   AND FIN.RECDESP IN (0, 1)
@@ -621,6 +630,7 @@ def extrato():
                 "historico":     r[15],
                 "atrasoDias":    int(r[16]) if r[16] is not None else 0,
                 "situacao":      r[17],
+                "operacao":      _txt(r[18]),
             })
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
