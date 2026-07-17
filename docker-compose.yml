@@ -8,4 +8,8 @@ services:
       - "5000:5000"
     env_file:
       - .env
+    environment:
+      # Sem isso o Python bufferiza o stdout no container e os print() não aparecem
+      # no `docker compose logs` em tempo real.
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
