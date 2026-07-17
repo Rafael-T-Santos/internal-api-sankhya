@@ -210,6 +210,53 @@ def _ler_base_modelo():
             conexao.close()
 
 
+def _limpar_impostos(cod_prod):
+    """[TESTE] Zera os campos tributários-chave de `cod_prod` direto no Oracle.
+
+    Serve para testar a hipótese 1: se o produto for criado SEM esses campos, o
+    DatasetSP.save seguinte vira uma mudança real (vazio → valor) e talvez dispare o
+    recálculo. O save posterior restaura os valores-base, então o estado final é o
+    mesmo — mas com a diferença de ter passado por uma alteração de verdade.
+
+    Só mexe nos campos que a gente reenvia; GRUPOICMS/CODESPECST vão a NULL e TEMICMS
+    a 'N' (todos diferentes dos valores-base 35/60, 2400100, 'S').
+    """
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            raise RuntimeError("Falha na conexão com o banco")
+
+        cursor = conexao.cursor()
+        cursor.execute(
+            """
+            UPDATE TGFPEM
+            SET GRUPOICMS = NULL, TEMICMS = 'N', CODESPECST = NULL
+            WHERE CODPROD = :COD
+            """,
+            {"COD": cod_prod},
+        )
+        linhas_pem = cursor.rowcount
+        cursor.execute(
+            """
+            UPDATE TGFPRO
+            SET TEMICMS = 'N', CODESPECST = NULL
+            WHERE CODPROD = :COD
+            """,
+            {"COD": cod_prod},
+        )
+        linhas_pro = cursor.rowcount
+        conexao.commit()
+        return {"tgfpem": linhas_pem, "tgfpro": linhas_pro}
+    except Exception:
+        if conexao:
+            conexao.rollback()
+        raise
+    finally:
+        if conexao:
+            conexao.close()
+
+
 def recalcular_impostos(cod_prod):
     """Reprocessa a tributação de `cod_prod` via Sankhya, usando o modelo 11783 como base.
 
@@ -261,22 +308,30 @@ def recalcular_impostos(cod_prod):
 def teste_recalcular_impostos():
     """[PROVISÓRIA] Testa o recálculo de impostos via Sankhya num produto já existente.
 
-    Body: { "codProd": <int> }
+    Body: { "codProd": <int>, "limparAntes": <bool, opcional> }
+
+    Com "limparAntes": true, zera os campos tributários no banco ANTES do save (teste da
+    hipótese 1 — forçar que o DatasetSP.save seja uma mudança real).
     """
     data = request.get_json(silent=True)
     if not data or data.get("codProd") is None:
         return jsonify({"erro": "Parâmetro 'codProd' é obrigatório."}), 400
 
     cod_prod = data.get("codProd")
+    limpar_antes = bool(data.get("limparAntes", False))
 
     try:
+        limpeza = _limpar_impostos(cod_prod) if limpar_antes else None
         resultado = recalcular_impostos(cod_prod)
-        return jsonify({
+        resposta = {
             "sucesso": True,
             "codProd": cod_prod,
             "empresas": resultado["empresas"],
             "produto": resultado["produto"],
-        })
+        }
+        if limpeza is not None:
+            resposta["limpezaAntes"] = limpeza
+        return jsonify(resposta)
     except cx_Oracle.Error as err:
         print("Erro Oracle:", err)
         return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500

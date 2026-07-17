@@ -189,8 +189,10 @@ A descrição é montada como `TINTA {base} {tamanho} {cor} IQUINE`, em maiúscu
 
 ```jsonc
 // Request
-{ "codProd": 17421 }
+{ "codProd": 17421, "limparAntes": false }   // limparAntes default: false
 ```
+
+> `limparAntes: true` **zera no banco** (`TGFPEM`/`TGFPRO`) os campos `GRUPOICMS`, `TEMICMS` e `CODESPECST` do produto **antes** de chamar o `DatasetSP.save`. Serve para testar se o recálculo tributário só dispara quando o save representa uma **mudança real** (vazio → valor). O próprio save restaura os valores-base, então o estado final é o mesmo — mas passando por uma alteração de verdade. Use só em produto de teste.
 
 ```jsonc
 // 200 — respostas cruas do Sankhya, para inspeção
