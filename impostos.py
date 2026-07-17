@@ -210,13 +210,13 @@ def _ler_base_modelo():
             conexao.close()
 
 
-def _limpar_impostos(cod_prod):
-    """[TESTE] Zera os campos tributários-chave de `cod_prod` direto no Oracle.
+def limpar_impostos(cod_prod):
+    """Zera os campos tributários-chave de `cod_prod` direto no Oracle.
 
-    Serve para testar a hipótese 1: se o produto for criado SEM esses campos, o
-    DatasetSP.save seguinte vira uma mudança real (vazio → valor) e talvez dispare o
-    recálculo. O save posterior restaura os valores-base, então o estado final é o
-    mesmo — mas com a diferença de ter passado por uma alteração de verdade.
+    Isso força o DatasetSP.save seguinte a ser uma mudança REAL (vazio → valor), que é o
+    que dispara o recálculo tributário do Sankhya. O save posterior restaura os
+    valores-base, então o estado final é o mesmo — mas com a diferença de ter passado por
+    uma alteração de verdade. Usado tanto na rota de teste quanto no cadastro real.
 
     Só mexe nos campos que a gente reenvia; GRUPOICMS/CODESPECST vão a NULL e TEMICMS
     a 'N' (todos diferentes dos valores-base 35/60, 2400100, 'S').
@@ -248,6 +248,55 @@ def _limpar_impostos(cod_prod):
         linhas_pro = cursor.rowcount
         conexao.commit()
         return {"tgfpem": linhas_pem, "tgfpro": linhas_pro}
+    except Exception:
+        if conexao:
+            conexao.rollback()
+        raise
+    finally:
+        if conexao:
+            conexao.close()
+
+
+def restaurar_impostos(cod_prod):
+    """Restaura os campos tributários de `cod_prod` para os valores-base do modelo 11783.
+
+    Fallback usado quando o recálculo via Sankhya falha DEPOIS de `limpar_impostos`: sem
+    isso o produto ficaria com imposto em branco. Restaura o mesmo que a clonagem do
+    INSERT gravaria (por empresa, já que GRUPOICMS varia entre elas) — o produto volta ao
+    estado "clonado, sem recálculo".
+    """
+    empresas_base, produto_base = _ler_base_modelo()
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            raise RuntimeError("Falha na conexão com o banco")
+
+        cursor = conexao.cursor()
+        for emp in empresas_base:
+            cursor.execute(
+                """
+                UPDATE TGFPEM
+                SET GRUPOICMS = :G, TEMICMS = :T, CODESPECST = :C
+                WHERE CODPROD = :COD AND CODEMP = :E
+                """,
+                {
+                    "G": emp["GRUPOICMS"],
+                    "T": emp["TEMICMS"],
+                    "C": emp["CODESPECST"],
+                    "COD": cod_prod,
+                    "E": emp["CODEMP"],
+                },
+            )
+        cursor.execute(
+            """
+            UPDATE TGFPRO
+            SET TEMICMS = :T, CODESPECST = :C
+            WHERE CODPROD = :COD
+            """,
+            {"T": produto_base["TEMICMS"], "C": produto_base["CODESPECST"], "COD": cod_prod},
+        )
+        conexao.commit()
     except Exception:
         if conexao:
             conexao.rollback()
@@ -321,7 +370,7 @@ def teste_recalcular_impostos():
     limpar_antes = bool(data.get("limparAntes", False))
 
     try:
-        limpeza = _limpar_impostos(cod_prod) if limpar_antes else None
+        limpeza = limpar_impostos(cod_prod) if limpar_antes else None
         resultado = recalcular_impostos(cod_prod)
         resposta = {
             "sucesso": True,

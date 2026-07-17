@@ -57,7 +57,7 @@ Lidas em [`conectar_oracle()`](app.py#L12). As três são obrigatórias; se qual
 | `DB_PASS` | Senha do Oracle | `••••••` |
 | `DB_DSN` | Host:porta/serviço | `192.168.255.250:1521/xe` |
 
-Para o recálculo de impostos via API Sankhya (ver [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos)) também são necessárias:
+Para o recálculo de impostos via API Sankhya (usado no [`/api/cadastrar-produto`](#post-apicadastrar-produto) e na rota de teste [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos)) também são necessárias:
 
 | Variável | Descrição | Origem |
 |---|---|---|
@@ -147,6 +147,18 @@ O que acontece por baixo:
 4. Gera o `REFFORN` incrementando o último da mesma marca.
 5. Clona `TGFPEM`, `TGFFCP` e `TGFEPR` do produto-modelo (clonagem tributária).
 6. Insere a base (`QTDMISTURA = 1`) e cada pigmento em `TGFICP`, na ordem recebida.
+7. **Recálculo tributário via API Sankhya** (fora da transação, após o `commit`): gravar
+   imposto direto no banco **não** dispara o motor de cálculo do Sankhya, então o produto
+   nasceria com imposto inconsistente. Para corrigir, a rota limpa os campos-chave
+   (`GRUPOICMS`, `TEMICMS`, `CODESPECST` em `TGFPEM`/`TGFPRO`) e reprocessa via
+   `DatasetSP.save` (entidades `EmpresaProdutoImpostos`, uma vez por empresa, e `Produto`) —
+   o que força o ERP a recalcular. Requer as variáveis `SANKHYA_*` (ver
+   [Variáveis de ambiente](#variáveis-de-ambiente)). Detalhes do mecanismo na rota de teste
+   [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos).
+
+Se esse recálculo falhar (Gateway fora, credencial, timeout), o cadastro **não** é
+derrubado: a rota **restaura** os valores clonados no banco (produto volta ao estado
+"clonado, sem recálculo") e devolve `sucesso: true` com um campo extra `avisoImpostos`.
 
 A descrição é montada como `TINTA {base} {tamanho} {cor} IQUINE`, em maiúsculas, truncada em 100 caracteres.
 
@@ -171,6 +183,15 @@ A descrição é montada como `TINTA {base} {tamanho} {cor} IQUINE`, em maiúscu
   "codigo": "17421",
   "nomeProduto": "TINTA ACRÍLICA 18L AZUL SERENO IQUINE",
   "mensagem": "Produto cadastrado com 2 componentes."
+}
+
+// 200 — produto criado, mas o recálculo tributário via Sankhya falhou
+{
+  "sucesso": true,
+  "codigo": "17421",
+  "nomeProduto": "TINTA ACRÍLICA 18L AZUL SERENO IQUINE",
+  "mensagem": "Produto cadastrado com 2 componentes.",
+  "avisoImpostos": "Recálculo automático de impostos falhou; produto criado com valores clonados (sem recálculo). Refazer o recálculo manualmente."
 }
 
 // 400 — sem base e sem pigmentos
@@ -531,7 +552,7 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
 
-Além do Oracle, a rota [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos) faz **chamada HTTP externa ao Gateway de APIs do Sankhya** (serviço `DatasetSP.save`, entidades `EmpresaProdutoImpostos` e `Produto`) — nova dependência `requests` e novo modo de falha caso o Gateway esteja fora ou as credenciais estejam erradas.
+Além do Oracle, as rotas [`/api/cadastrar-produto`](#post-apicadastrar-produto) e [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos) fazem **chamada HTTP externa ao Gateway de APIs do Sankhya** (serviço `DatasetSP.save`, entidades `EmpresaProdutoImpostos` e `Produto`) — nova dependência `requests` e novo modo de falha caso o Gateway esteja fora ou as credenciais estejam erradas. No cadastro, essa falha não derruba a operação (ver `avisoImpostos`).
 
 ---
 

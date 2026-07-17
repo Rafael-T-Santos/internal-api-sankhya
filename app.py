@@ -4,7 +4,12 @@ from flask_cors import CORS
 
 from db import conectar_oracle
 from cobranca import bp as cobranca_bp
-from impostos import bp as impostos_bp
+from impostos import (
+    bp as impostos_bp,
+    limpar_impostos,
+    recalcular_impostos,
+    restaurar_impostos,
+)
 
 # --- Configuração da API ---
 app = Flask(__name__)
@@ -356,12 +361,37 @@ def cadastrar_produto():
         # Se chegou até aqui, o produto e todos os N componentes foram processados sem erro
         conexao.commit()
 
-        return jsonify({
+        # --- PASSO 4: Recálculo tributário via API Sankhya ---
+        # Gravar imposto direto no banco (a clonagem do INSERT) NÃO dispara o motor de
+        # cálculo do Sankhya. Forçamos uma alteração real (limpa os campos-chave) e
+        # reprocessamos via DatasetSP.save, o que faz o ERP recalcular. Roda FORA da
+        # transação do produto (já commitado). Se falhar, restauramos os valores clonados
+        # para não deixar o imposto em branco — o produto fica no estado de hoje (clonado,
+        # sem recálculo) e devolvemos um aviso, sem derrubar o cadastro.
+        aviso_impostos = None
+        try:
+            limpar_impostos(novo_codprod)
+            recalcular_impostos(novo_codprod)
+        except Exception as e_imp:
+            print("Falha no recálculo de impostos:", e_imp)
+            try:
+                restaurar_impostos(novo_codprod)
+            except Exception as e_rest:
+                print("Falha ao restaurar impostos clonados:", e_rest)
+            aviso_impostos = (
+                "Recálculo automático de impostos falhou; produto criado com valores "
+                "clonados (sem recálculo). Refazer o recálculo manualmente."
+            )
+
+        resposta = {
             "sucesso": True,
             "codigo": str(novo_codprod),
             "nomeProduto": descr_prod,
             "mensagem": f"Produto cadastrado com {len(lista_componentes)} componentes."
-        })
+        }
+        if aviso_impostos:
+            resposta["avisoImpostos"] = aviso_impostos
+        return jsonify(resposta)
 
     except cx_Oracle.Error as err:
         if conexao:
