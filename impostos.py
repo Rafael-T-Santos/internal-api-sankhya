@@ -73,9 +73,16 @@ def autenticar_sankhya():
             f"Falha na autenticação do Sankhya (HTTP {resp.status_code}): {resp.text}"
         )
 
-    token = resp.json().get("access_token")
+    try:
+        corpo = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Autenticação retornou corpo não-JSON (HTTP {resp.status_code}): {resp.text[:500]}"
+        )
+
+    token = corpo.get("access_token")
     if not token:
-        raise RuntimeError(f"Autenticação sem access_token na resposta: {resp.text}")
+        raise RuntimeError(f"Autenticação sem access_token na resposta: {resp.text[:500]}")
     return token
 
 
@@ -114,6 +121,9 @@ def _salvar_dataset(token, entity_name, fields, record):
 
     resp = requests.post(
         f"{_api_base()}/gateway/v1/mge/service.sbr",
+        # serviceName + outputType=json vão na query string: sem outputType=json o
+        # service.sbr responde XML e o resp.json() estoura.
+        params={"serviceName": "DatasetSP.save", "outputType": "json"},
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -127,7 +137,12 @@ def _salvar_dataset(token, entity_name, fields, record):
             f"DatasetSP.save ({entity_name}) HTTP {resp.status_code}: {resp.text}"
         )
 
-    corpo = resp.json()
+    try:
+        corpo = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"DatasetSP.save ({entity_name}) retornou corpo não-JSON: {resp.text[:500]}"
+        )
     # Envelope do Sankhya: status "1" = sucesso, "0" = erro (com statusMessage).
     if str(corpo.get("status")) != "1":
         msg = corpo.get("statusMessage") or corpo
