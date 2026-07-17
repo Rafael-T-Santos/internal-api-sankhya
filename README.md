@@ -57,6 +57,17 @@ Lidas em [`conectar_oracle()`](app.py#L12). As três são obrigatórias; se qual
 | `DB_PASS` | Senha do Oracle | `••••••` |
 | `DB_DSN` | Host:porta/serviço | `192.168.255.250:1521/xe` |
 
+Para o recálculo de impostos via API Sankhya (ver [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos)) também são necessárias:
+
+| Variável | Descrição | Origem |
+|---|---|---|
+| `SANKHYA_X_TOKEN` | Token de vínculo do Gateway | Tela **Configurações de Gateway** do Sankhya Om |
+| `SANKHYA_CLIENT_ID` | Identificador da aplicação | **Portal do Desenvolvedor** |
+| `SANKHYA_CLIENT_SECRET` | Segredo da aplicação | **Portal do Desenvolvedor** |
+| `SANKHYA_API_BASE` | Base do Gateway (opcional) | Default `https://api.sankhya.com.br`; use `https://api.sandbox.sankhya.com.br` para testar |
+
+> Os três primeiros precisam ser da **mesma aplicação** — misturar Client ID/Secret de uma aplicação com o X-Token de outra é o erro mais comum (`Token e Appkey não associados`).
+
 O `.env` é lido pelo `docker-compose` e está no `.gitignore` — **nunca commite credenciais**.
 
 ---
@@ -164,6 +175,43 @@ A descrição é montada como `TINTA {base} {tamanho} {cor} IQUINE`, em maiúscu
 
 // 400 — sem base e sem pigmentos
 { "erro": "O produto precisa ter pelo menos uma base ou componente." }
+```
+
+---
+
+#### `POST /api/teste-recalcular-impostos`
+
+> ⚠️ **Rota provisória de validação.** Existe para testar o recálculo de impostos pela API do Sankhya antes de integrá-lo ao `/api/cadastrar-produto`. Pode ser removida/absorvida depois.
+
+**Por que existe:** o `/api/cadastrar-produto` grava a tributação com `INSERT` direto no Oracle (clonando o modelo `11783`), e isso **não dispara o motor de cálculo tributário do Sankhya** — o produto nasce com impostos inconsistentes. Esta rota reprocessa a tributação pela API oficial, chamando o serviço `DatasetSP.save` nas entidades `EmpresaProdutoImpostos` (uma vez **por empresa** do modelo em `TGFPEM`) e `Produto`, o que força o ERP a recalcular.
+
+**Fluxo:** lê a tributação-base do produto-modelo `11783` (empresas de `TGFPEM` + campos de `TGFPRO`) → autentica no Gateway (OAuth 2.0 `client_credentials`, token de ~5 min) → dispara os `DatasetSP.save` no `codProd` informado. Requer as variáveis `SANKHYA_*` (ver [Variáveis de ambiente](#variáveis-de-ambiente)).
+
+```jsonc
+// Request
+{ "codProd": 17421 }
+```
+
+```jsonc
+// 200 — respostas cruas do Sankhya, para inspeção
+{
+  "sucesso": true,
+  "codProd": 17421,
+  "empresas": [
+    { "codEmp": 1, "resposta": { /* responseBody do Sankhya */ } },
+    { "codEmp": 3, "resposta": { /* responseBody do Sankhya */ } }
+  ],
+  "produto": { /* responseBody do Sankhya */ }
+}
+
+// 400 — sem codProd
+{ "erro": "Parâmetro 'codProd' é obrigatório." }
+
+// 500 — credencial ausente, save recusado pelo Sankhya, ou erro de banco
+{ "erro": "Credenciais do Sankhya (...) não configuradas nas variáveis de ambiente." }
+
+// 502 — falha de comunicação HTTP com o Gateway
+{ "erro": "Falha de comunicação com o Sankhya: ..." }
 ```
 
 ---
@@ -480,6 +528,8 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 **Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca).
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
+
+Além do Oracle, a rota [`/api/teste-recalcular-impostos`](#post-apiteste-recalcular-impostos) faz **chamada HTTP externa ao Gateway de APIs do Sankhya** (serviço `DatasetSP.save`, entidades `EmpresaProdutoImpostos` e `Produto`) — nova dependência `requests` e novo modo de falha caso o Gateway esteja fora ou as credenciais estejam erradas.
 
 ---
 

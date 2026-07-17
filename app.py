@@ -4,6 +4,7 @@ from flask_cors import CORS
 
 from db import conectar_oracle
 from cobranca import bp as cobranca_bp
+from impostos import bp as impostos_bp
 
 # --- Configuração da API ---
 app = Flask(__name__)
@@ -12,6 +13,9 @@ CORS(app)
 
 # Rotas do módulo de Cobrança (ver cobranca.py).
 app.register_blueprint(cobranca_bp)
+
+# Rotas do módulo de Impostos / recálculo tributário via API Sankhya (ver impostos.py).
+app.register_blueprint(impostos_bp)
 
 # --- Endpoints da API ---
 
