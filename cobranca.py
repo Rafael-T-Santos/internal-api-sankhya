@@ -7,6 +7,7 @@ Os paths das 4 rotas antigas foram preservados (/api/cidades, /api/vendedores,
 /api/parceiros, /api/receitas-vencidas) para não quebrar o app que já as consome.
 As rotas novas ficam sob /api/cobranca/*.
 """
+
 import cx_Oracle
 from flask import Blueprint, jsonify, request
 
@@ -217,6 +218,7 @@ JOINS_TITULO = """
 
 # --- Listas de apoio (filtros) ---
 
+
 @bp.route("/api/cidades", methods=["GET"])
 def cidades():
     # TSICID.UF guarda o CÓDIGO da UF; a sigla vem da TSIUFS.
@@ -348,7 +350,8 @@ WHERE FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
   AND (
         /* Títulos normais de cobrança. */
-        (FIN.CODTIPTIT IN (2, 4, 5, 39) AND FIN.DHBAIXA IS NULL AND FIN.DTVENC < TRUNC(SYSDATE))
+        /* (FIN.CODTIPTIT IN (2, 4, 5, 39) AND FIN.DHBAIXA IS NULL AND FIN.DTVENC < TRUNC(SYSDATE)) */
+        (FIN.CODTIPTIT IN (2, 4, 5, 39) AND FIN.DHBAIXA IS NULL)
         OR
         /* Cheques: só os aprovados pela regra do relatório. */
         (FIN.CODTIPTIT = 3 AND CHR.NUFIN IS NOT NULL)
@@ -359,7 +362,7 @@ WHERE FIN.RECDESP = 1
             FIN.CODTIPTIT NOT IN (2, 3, 4, 5, 39)
             AND FIN.NURENEG IS NOT NULL
             AND FIN.DHBAIXA IS NULL
-            AND FIN.DTVENC < TRUNC(SYSDATE)
+            /* AND FIN.DTVENC < TRUNC(SYSDATE) */
         )
       )
 """
@@ -369,12 +372,12 @@ WHERE FIN.RECDESP = 1
 def receitas_vencidas():
     data = request.get_json() or {}
 
-    cod_emp    = data.get("codEmp")
-    cod_parc   = data.get("codParc")
-    cod_vend   = data.get("codVend")
-    cod_cid    = data.get("codCid")
+    cod_emp = data.get("codEmp")
+    cod_parc = data.get("codParc")
+    cod_vend = data.get("codVend")
+    cod_cid = data.get("codCid")
     dt_inicial = data.get("dtInicial")
-    dt_final   = data.get("dtFinal")
+    dt_final = data.get("dtFinal")
 
     filtros = []
     params = {}
@@ -418,47 +421,49 @@ def receitas_vencidas():
 
         dados = []
         for row in cursor.fetchall():
-            dados.append({
-                "nossoNum":      row[0],
-                "nuCompens":     row[1],
-                "nuNota":        row[2],
-                "dtNeg":         row[3].strftime('%Y-%m-%d') if row[3] else None,
-                "dtVenc":        row[4].strftime('%Y-%m-%d') if row[4] else None,
-                "nuFin":         row[5],
-                "numNota":       row[6],
-                "vlrDesdob":     float(row[7]) if row[7] is not None else None,
-                "vlrLiquido":    float(row[8]) if row[8] is not None else None,
-                "vlrCheque":     float(row[9]) if row[9] is not None else None,
-                "numeroCheque":  row[10],
-                "historico":     row[11],
-                "contaBancaria": row[12],
-                "razaoSocial":   row[13],
-                "codParc":       row[14],
-                "nomeParc":      row[15],
-                "telefone":      row[16],
-                "codCid":        row[17],
-                "nomeCid":       row[18],
-                "uf":            row[19],
-                "cgcCpfCmc7":    row[20],
-                "codTipTit":     row[21],
-                "tipoTitulo":    row[22],
-                "situacao":      row[23],
-                "ultimoEvento":  row[24],
-                "origemRegra":   row[25],
-                "nuReneg":       row[26],
-                "vlrDesconto":   float(row[27]) if row[27] is not None else 0.0,
-                "cnpjCpf":       row[28],
-                "vlrJuros":      float(row[29]) if row[29] is not None else 0.0,
-                "atrasoDias":    int(row[30]) if row[30] is not None else 0,
-                "vendedor":      row[31],
-                "codObsPadrao":  row[32],
-                "observacao":    row[33],
-                "desdobramento": row[34],
-                "nomeEmitente":  row[35],
-                "recDesp":       row[36],
-                "codTipOper":    row[37],
-                "operacao":      _txt(row[38]),
-            })
+            dados.append(
+                {
+                    "nossoNum": row[0],
+                    "nuCompens": row[1],
+                    "nuNota": row[2],
+                    "dtNeg": row[3].strftime("%Y-%m-%d") if row[3] else None,
+                    "dtVenc": row[4].strftime("%Y-%m-%d") if row[4] else None,
+                    "nuFin": row[5],
+                    "numNota": row[6],
+                    "vlrDesdob": float(row[7]) if row[7] is not None else None,
+                    "vlrLiquido": float(row[8]) if row[8] is not None else None,
+                    "vlrCheque": float(row[9]) if row[9] is not None else None,
+                    "numeroCheque": row[10],
+                    "historico": row[11],
+                    "contaBancaria": row[12],
+                    "razaoSocial": row[13],
+                    "codParc": row[14],
+                    "nomeParc": row[15],
+                    "telefone": row[16],
+                    "codCid": row[17],
+                    "nomeCid": row[18],
+                    "uf": row[19],
+                    "cgcCpfCmc7": row[20],
+                    "codTipTit": row[21],
+                    "tipoTitulo": row[22],
+                    "situacao": row[23],
+                    "ultimoEvento": row[24],
+                    "origemRegra": row[25],
+                    "nuReneg": row[26],
+                    "vlrDesconto": float(row[27]) if row[27] is not None else 0.0,
+                    "cnpjCpf": row[28],
+                    "vlrJuros": float(row[29]) if row[29] is not None else 0.0,
+                    "atrasoDias": int(row[30]) if row[30] is not None else 0,
+                    "vendedor": row[31],
+                    "codObsPadrao": row[32],
+                    "observacao": row[33],
+                    "desdobramento": row[34],
+                    "nomeEmitente": row[35],
+                    "recDesp": row[36],
+                    "codTipOper": row[37],
+                    "operacao": _txt(row[38]),
+                }
+            )
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
 
@@ -583,26 +588,30 @@ def cliente():
         quitados = int(quitados or 0)
         em_dia = int(em_dia or 0)
 
-        return jsonify({
-            "sucesso": True,
-            "dados": {
-                "codParc":       row[0],
-                "nomeParc":      _txt(row[1]),
-                "razaoSocial":   _txt(row[2]),
-                "cgcCpf":        _txt(row[3]),
-                "telefone":      _txt(row[4]),
-                "email":         _txt(row[5]),
-                "limiteCredito": float(row[6]) if row[6] is not None else 0.0,
-                "ativo":         row[7],
-                "nomeCid":       _txt(row[8]),
-                "uf":            _txt(row[9]),
-                "vendedor":      _txt(row[10]),
-                # null quando não há histórico: o front mostra "sem histórico",
-                # em vez de fingir que 0% de pontualidade é um fato.
-                "pontualidade": round(em_dia * 100.0 / quitados, 1) if quitados else None,
-                "titulosQuitados12m": quitados,
-            },
-        })
+        return jsonify(
+            {
+                "sucesso": True,
+                "dados": {
+                    "codParc": row[0],
+                    "nomeParc": _txt(row[1]),
+                    "razaoSocial": _txt(row[2]),
+                    "cgcCpf": _txt(row[3]),
+                    "telefone": _txt(row[4]),
+                    "email": _txt(row[5]),
+                    "limiteCredito": float(row[6]) if row[6] is not None else 0.0,
+                    "ativo": row[7],
+                    "nomeCid": _txt(row[8]),
+                    "uf": _txt(row[9]),
+                    "vendedor": _txt(row[10]),
+                    # null quando não há histórico: o front mostra "sem histórico",
+                    # em vez de fingir que 0% de pontualidade é um fato.
+                    "pontualidade": round(em_dia * 100.0 / quitados, 1)
+                    if quitados
+                    else None,
+                    "titulosQuitados12m": quitados,
+                },
+            }
+        )
 
     except cx_Oracle.Error as err:
         return _erro(f"Erro de Banco de Dados: {err}")
@@ -632,28 +641,30 @@ def extrato():
 
         dados = []
         for r in cursor.fetchall():
-            dados.append({
-                "nuFin":         r[0],
-                "numNota":       r[1],
-                "nuNota":        r[2],
-                "desdobramento": r[3],
-                "dtNeg":         r[4].strftime('%Y-%m-%d') if r[4] else None,
-                "dtVenc":        r[5].strftime('%Y-%m-%d') if r[5] else None,
-                "vlrDesdob":     float(r[6]) if r[6] is not None else None,
-                "vlrCheque":     float(r[7]) if r[7] is not None else None,
-                "vlrLiquido":    float(r[8]) if r[8] is not None else None,
-                "vlrJuros":      float(r[9]) if r[9] is not None else 0.0,
-                "vlrDesconto":   float(r[10]) if r[10] is not None else 0.0,
-                "codTipTit":     r[11],
-                "tipoTitulo":    r[12],
-                "numeroCheque":  r[13],
-                "ultimoEvento":  r[14],
-                "historico":     r[15],
-                "atrasoDias":    int(r[16]) if r[16] is not None else 0,
-                "situacao":      r[17],
-                "operacao":      _txt(r[18]),
-                "nuReneg":       r[19],
-            })
+            dados.append(
+                {
+                    "nuFin": r[0],
+                    "numNota": r[1],
+                    "nuNota": r[2],
+                    "desdobramento": r[3],
+                    "dtNeg": r[4].strftime("%Y-%m-%d") if r[4] else None,
+                    "dtVenc": r[5].strftime("%Y-%m-%d") if r[5] else None,
+                    "vlrDesdob": float(r[6]) if r[6] is not None else None,
+                    "vlrCheque": float(r[7]) if r[7] is not None else None,
+                    "vlrLiquido": float(r[8]) if r[8] is not None else None,
+                    "vlrJuros": float(r[9]) if r[9] is not None else 0.0,
+                    "vlrDesconto": float(r[10]) if r[10] is not None else 0.0,
+                    "codTipTit": r[11],
+                    "tipoTitulo": r[12],
+                    "numeroCheque": r[13],
+                    "ultimoEvento": r[14],
+                    "historico": r[15],
+                    "atrasoDias": int(r[16]) if r[16] is not None else 0,
+                    "situacao": r[17],
+                    "operacao": _txt(r[18]),
+                    "nuReneg": r[19],
+                }
+            )
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
 
