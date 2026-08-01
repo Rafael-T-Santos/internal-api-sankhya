@@ -25,6 +25,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
   - [Cobrança](#cobrança)
   - [Cobrança — operador](#cobrança--operador)
   - [Cobrança — régua de chamadas (escrita)](#cobrança--régua-de-chamadas-escrita)
+- [Testes](#testes)
 - [Constantes hardcoded](#constantes-hardcoded)
 - [Tabelas do Sankhya usadas](#tabelas-do-sankhya-usadas)
 - [Limitações conhecidas](#limitações-conhecidas)
@@ -76,6 +77,14 @@ Para o recálculo de impostos via API Sankhya (usado no [`/api/cadastrar-produto
 | `SANKHYA_API_BASE` | Base do Gateway (opcional) | Default `https://api.sankhya.com.br`; use `https://api.sandbox.sankhya.com.br` para testar |
 
 > Os três primeiros precisam ser da **mesma aplicação** — misturar Client ID/Secret de uma aplicação com o X-Token de outra é o erro mais comum (`Token e Appkey não associados`).
+
+Para a sessão do operador na régua de chamadas:
+
+| Variável | Descrição |
+|---|---|
+| `COBRANCA_SECRET` | Chave que assina os tokens de sessão. Qualquer string longa e aleatória — ex.: `python -c "import secrets;print(secrets.token_urlsafe(48))"` |
+
+**Opcional, mas defina no servidor.** Sem ela cada processo sorteia o próprio segredo ao subir, e todo `docker compose up` desloga os operadores no meio do expediente.
 
 O `.env` é lido pelo `docker-compose` e está no `.gitignore` — **nunca commite credenciais**.
 
@@ -558,9 +567,16 @@ Todos os títulos em aberto do cliente — **vencidos e a vencer**. Body: `{ "co
 
 #### `POST /api/cobranca/login`
 
-Autentica o operador. Body: `{ "usuario": "<NOMEUSU>", "senha": "..." }` → `{ "sucesso": true, "codUsu": 7, "nomeUsu": "FULANO" }`; `401` com credencial inválida.
+Autentica o operador e **abre a sessão**. Body: `{ "usuario": "<NOMEUSU>", "senha": "..." }`; `401` com credencial inválida.
+
+```jsonc
+{ "sucesso": true, "codUsu": 7, "nomeUsu": "FULANO",
+  "token": "eyJjb2RVc3UiOjd9.hR2k…", "expiraEmHoras": 12 }
+```
 
 **A senha não é conferida no Oracle.** Quem valida é o próprio Sankhya, pelo serviço `MobileLoginSP.login` chamado via Gateway (o hash da `TSIUSU` é proprietário e reproduzi-lo aqui seria frágil). Validada a senha, o `CODUSU` é resolvido na `TSIUSU` por `UPPER(NOMEUSU)`.
+
+O **token** é assinado com HMAC-SHA256 e carrega `codUsu`, `nomeUsu` e a expiração — não há tabela de sessão nem dicionário em memória. É ele que autoriza as rotas de escrita da régua (ver abaixo).
 
 #### `GET /api/cobranca/operadores`
 
@@ -586,6 +602,14 @@ Grava em três tabelas customizadas: `AD_COBRCHAMADA` (cabeçalho), `AD_COBRCHAM
 
 Domínios aceitos: `sentido` = `PROATIVA`/`RECEPTIVA`; `status` = `ATENDEU`/`CAIXA_POSTAL`/`RECUSOU`/`AGENDOU`; `desfecho` = `ACORDO`/`SEM_ACORDO`/`EM_ABERTO`. Valor fora do domínio → `400`.
 
+> ### Todas as rotas de escrita exigem sessão
+>
+> `Authorization: Bearer <token do login>`. Sem token, com token adulterado ou vencido → **`401`**.
+>
+> **O `codUsu` não é aceito no corpo.** Quem ligou sai do token, não do que o cliente HTTP diz ser. Antes disso, qualquer um na rede registrava chamada em nome de outra pessoa — inaceitável para uma trilha que justifica negativação.
+>
+> O token também é aceito como `?token=<...>` na query string. Isso existe por um motivo só: `navigator.sendBeacon`, usado pelo app para cancelar a chamada quando o operador fecha a aba, **não consegue enviar cabeçalhos**.
+
 > As colunas foram criadas quase todas **nullable** no Sankhya. Quem impõe a obrigatoriedade é esta API, não o banco.
 
 #### `POST /api/cobranca/chamadas/iniciar`
@@ -593,8 +617,8 @@ Domínios aceitos: `sentido` = `PROATIVA`/`RECEPTIVA`; `status` = `ATENDEU`/`CAI
 Abre a chamada (rascunho `EM_ANDAMENTO`) e **adquire a trava** dos títulos.
 
 ```jsonc
-// Request
-{ "codParc": 100, "nufins": [987654, 987655], "sentido": "PROATIVA", "codUsu": 7 }
+// Request  (+ header Authorization: Bearer <token>)
+{ "codParc": 100, "nufins": [987654, 987655], "sentido": "PROATIVA" }
 ```
 
 ```jsonc
@@ -652,7 +676,7 @@ Anexa um **link** (drive da empresa) à chamada — não guardamos arquivo.
 
 ```jsonc
 // Request → 201 { "codAnexo": 12, ... }
-{ "url": "https://drive.empresa.com/x/boleto.pdf", "descricao": "Boleto renegociado", "codUsu": 7 }
+{ "url": "https://drive.empresa.com/x/boleto.pdf", "descricao": "Boleto renegociado" }
 ```
 
 A `url` precisa começar com `http://` ou `https://` (o app abre o link direto; aceitar `javascript:` seria execução de script vinda de um campo de texto). `409` se a chamada foi cancelada.
@@ -665,15 +689,41 @@ Histórico do cliente: cabeçalho + `itens` (com `ordem` e `desfecho`) + `anexos
 
 Títulos em chamada **neste momento** (alimenta o badge "em chamada por..."). Sem `nufins`, devolve todas as travas ativas — são poucas por natureza (uma por título aberto num modal), então o filtro é aplicado em memória e a tela não precisa mandar centenas de `NUFIN` na query string.
 
-#### `GET /api/cobranca/regua?codParc=100`
+#### `GET /api/cobranca/regua[?codParc=100]`
 
-Posição de cada título do cliente na régua (badge 1ª/2ª/3ª chamada).
+Posição de cada título na régua (badge 1ª/2ª/3ª chamada).
 
 ```jsonc
 { "sucesso": true, "totalRegistros": 1, "dados": [
-  { "nufin": 987654, "ordemAtual": 3, "dhUltima": "2026-08-01 09:20:00",
+  { "nufin": 987654, "codParc": 100, "ordemAtual": 3, "dhUltima": "2026-08-01 09:20:00",
     "ultimoDesfecho": "SEM_ACORDO", "codChamada": 41, "podeJuridico": true } ] }
 ```
+
+`codParc` é **opcional**: sem ele vem a carteira inteira, para a tela de títulos vencidos montar os badges de todos os clientes de uma vez. Isso não devolve a base toda — só entram títulos que **já tiveram** chamada proativa finalizada.
+
+---
+
+## Testes
+
+Um só, e cobre apenas a régua de chamadas — que é a única parte da API que **escreve** no banco por regra de negócio (trava de concorrência, cálculo da régua, transação).
+
+```powershell
+.\tests\smoke-chamadas.ps1                        # cliente 11107, operador 25
+.\tests\smoke-chamadas.ps1 -CodParc 12366 -CodUsu 25
+```
+
+**Rode depois de todo deploy que mexa em `cobranca.py`.** Ele bate na API real: não existe banco de teste, então grava registros de verdade em `AD_COBRCHAMADA`/`ITEM`/`ANEXO` para um cliente real — escolha um que possa ser sujado. No fim ele imprime o SQL de limpeza já com os `CODCHAMADA` gerados.
+
+Cobre sequences gerando PK, trava de 15 minutos, conflito `409` com `nufinsTravados`, **corrida real** (dois `/iniciar` disparados em paralelo, esperando um `201` e um `409`), cancelamento idempotente, renovação, anexo gravado e lido de volta do CLOB, URL `javascript:` recusada, `ORDEM` por título com desfechos independentes, finalização dupla e chamada receptiva que não conta na régua.
+
+Não cobre a expiração dos 15 minutos — não dá para esperar num teste. Para conferir à mão, com uma chamada `EM_ANDAMENTO` aberta:
+
+```sql
+UPDATE AD_COBRCHAMADA SET DHEXPIRA = SYSDATE - 1 WHERE CODCHAMADA = <id>;
+COMMIT;
+```
+
+Depois disso `GET /api/cobranca/locks` tem que voltar vazio.
 
 ---
 
@@ -717,13 +767,14 @@ Além do Oracle, as rotas [`/api/cadastrar-produto`](#post-apicadastrar-produto)
 
 Nada disso é bug novo — é o estado atual, documentado para quem for mexer:
 
-- **Sem autenticação.** Qualquer um com acesso de rede chama qualquer rota, inclusive as que gravam (`/api/cadastrar-produto`, `/api/registrar-contagem`, `/api/cobranca/chamadas/*`). A API depende inteiramente de estar em rede fechada. O `/api/cobranca/login` autentica o **operador** (para saber quem ligou), não a chamada HTTP: o `codUsu` chega no body e não é verificado contra uma sessão.
+- **Sem autenticação, exceto na régua de chamadas.** As rotas de escrita da cobrança exigem token de sessão; todo o resto (inclusive `/api/cadastrar-produto` e `/api/registrar-contagem`, que gravam) segue aberto a qualquer um com acesso de rede. A API continua dependendo de estar em rede fechada.
+- **A sessão cai quando o container reinicia**, a menos que `COBRANCA_SECRET` esteja definida — sem ela, cada processo sorteia o próprio segredo na subida e os tokens antigos deixam de valer.
 - **CORS liberado para qualquer origem** (`CORS(app)` sem restrição).
 - **Servidor de desenvolvimento.** O container roda `flask run`, não um WSGI de produção (gunicorn/waitress). Single-threaded e não recomendado para carga real.
 - **Uma conexão nova por request**, aberta e fechada a cada chamada — sem pool. Sob concorrência, isso vira gargalo no Oracle.
 - **Sem healthcheck** (`/health`) e sem logging estruturado — só `print()` para stdout.
 - **Sem paginação** em `/api/parceiros`, `/api/cidades`, `/api/vendedores` e `/api/receitas-vencidas` sem filtro.
-- **Sem testes.**
+- **Quase sem testes.** Só a régua de chamadas tem cobertura ([tests/smoke-chamadas.ps1](#testes)); os outros 4 domínios não têm nenhuma.
 
 As queries usam bind variables em todos os endpoints, inclusive no SQL dinâmico de `/api/verificar-produto` — não há injeção de SQL.
 

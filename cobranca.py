@@ -8,7 +8,15 @@ Os paths das 4 rotas antigas foram preservados (/api/cidades, /api/vendedores,
 As rotas novas ficam sob /api/cobranca/*.
 """
 
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
 from datetime import datetime
+from functools import wraps
 from urllib.parse import unquote
 
 import cx_Oracle
@@ -708,6 +716,90 @@ def extrato():
 # ===========================================================================
 
 
+# ---------------------------------------------------------------------------
+# Sessão do operador
+#
+# Validar a senha no login não bastava: o CODUSU seguia viajando no CORPO das
+# requisições de escrita, então qualquer um na rede podia registrar chamada em
+# nome de outra pessoa. Como essa trilha justifica negativação — que tem efeito
+# jurídico para o cliente —, "quem ligou" precisa ser provado, não declarado.
+#
+# O token é assinado (HMAC-SHA256), não guardado: não há tabela de sessão nem
+# dicionário em memória para sincronizar entre workers. Ele carrega o CODUSU e
+# a expiração, e a assinatura impede que sejam alterados.
+# ---------------------------------------------------------------------------
+
+_SESSAO_HORAS = 12  # um turno de trabalho: entra uma vez por dia
+
+# Sem COBRANCA_SECRET no ambiente cada processo gera o seu — funciona, mas todo
+# mundo é deslogado a cada restart do container. Defina no .env do servidor.
+_SEGREDO_VOLATIL = secrets.token_bytes(32)
+
+
+def _segredo():
+    do_ambiente = os.environ.get("COBRANCA_SECRET")
+    return do_ambiente.encode() if do_ambiente else _SEGREDO_VOLATIL
+
+
+def _b64(dados):
+    return base64.urlsafe_b64encode(dados).rstrip(b"=").decode()
+
+
+def _de_b64(texto):
+    # Repõe o padding que tiramos na hora de gerar.
+    return base64.urlsafe_b64decode(texto + "=" * (-len(texto) % 4))
+
+
+def _emitir_token(cod_usu, nome_usu):
+    corpo = {
+        "codUsu": cod_usu,
+        "nomeUsu": nome_usu,
+        "exp": int(time.time()) + _SESSAO_HORAS * 3600,
+    }
+    dados = _b64(json.dumps(corpo, separators=(",", ":")).encode())
+    assinatura = _b64(hmac.new(_segredo(), dados.encode(), hashlib.sha256).digest())
+    return f"{dados}.{assinatura}"
+
+
+def _ler_token(token):
+    """Devolve o conteúdo do token, ou None se for inválido/adulterado/vencido."""
+    if not token or "." not in token:
+        return None
+    dados, _, assinatura = token.partition(".")
+    esperada = _b64(hmac.new(_segredo(), dados.encode(), hashlib.sha256).digest())
+    # compare_digest em vez de == : comparação de tempo constante.
+    if not hmac.compare_digest(esperada, assinatura):
+        return None
+    try:
+        corpo = json.loads(_de_b64(dados))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if float(corpo.get("exp") or 0) < time.time():
+        return None
+    return corpo
+
+
+def _exige_operador(f):
+    """Só passa com sessão válida; publica o operador em `request.operador`."""
+
+    @wraps(f)
+    def interno(*args, **kwargs):
+        cabecalho = request.headers.get("Authorization") or ""
+        if cabecalho[:7].lower() == "bearer ":
+            token = cabecalho[7:].strip()
+        else:
+            # navigator.sendBeacon não manda cabeçalho — é assim que o app
+            # cancela a chamada quando o operador fecha a aba no meio dela.
+            token = request.args.get("token") or ""
+        operador = _ler_token(token)
+        if not operador:
+            return jsonify({"erro": "Sessão expirada ou inválida. Entre de novo."}), 401
+        request.operador = operador
+        return f(*args, **kwargs)
+
+    return interno
+
+
 def _servico_sankhya(service_name, request_body):
     """Chama um serviço do Sankhya via Gateway e devolve o envelope JSON cru.
 
@@ -742,8 +834,10 @@ def login():
     """Valida usuário + senha do Sankhya e devolve o operador.
 
     Body: { "usuario": "<NOMEUSU>", "senha": "<senha>" }
-    200:  { "sucesso": true, "codUsu": <int>, "nomeUsu": "<...>" }
+    200:  { "sucesso": true, "codUsu": <int>, "nomeUsu": "<...>", "token": "<...>" }
     401:  credencial inválida.
+
+    O token vale 12 h e é o que autoriza as rotas de escrita da régua.
     """
     data = request.get_json(silent=True) or {}
     usuario = (data.get("usuario") or "").strip()
@@ -795,7 +889,16 @@ def login():
                 jsonify({"erro": f"Usuário '{usuario}' validado, mas sem CODUSU na TSIUSU."}),
                 500,
             )
-        return jsonify({"sucesso": True, "codUsu": int(row[0]), "nomeUsu": _txt(row[1])})
+        cod_usu, nome_usu = int(row[0]), _txt(row[1])
+        return jsonify(
+            {
+                "sucesso": True,
+                "codUsu": cod_usu,
+                "nomeUsu": nome_usu,
+                "token": _emitir_token(cod_usu, nome_usu),
+                "expiraEmHoras": _SESSAO_HORAS,
+            }
+        )
 
     except cx_Oracle.Error as err:
         return _erro(f"Erro de Banco de Dados: {err}")
@@ -999,17 +1102,21 @@ def _erro_oracle(err):
 
 
 @bp.route("/api/cobranca/chamadas/iniciar", methods=["POST"])
+@_exige_operador
 def chamada_iniciar():
     """Abre a chamada e ADQUIRE A TRAVA dos títulos.
 
-    Body: { codParc, nufins: [..], sentido: PROATIVA|RECEPTIVA, codUsu }
+    Body: { codParc, nufins: [..], sentido: PROATIVA|RECEPTIVA }
     201:  { codChamada, dhInicio, dhExpira, nufins }
     409:  { nufinsTravados: [{nufin, nomeUsu, desde, ...}] }
+
+    O operador vem da sessão, nunca do corpo: é ele que fica gravado como
+    "quem ligou".
     """
     data = request.get_json(silent=True) or {}
+    cod_usu = request.operador["codUsu"]
     try:
         cod_parc = _obrig_int(data, "codParc")
-        cod_usu = _obrig_int(data, "codUsu")
         sentido = _obrig_dominio(data, "sentido", _SENTIDOS)
         nufins = _lista_nufins(data)
     except _Invalido as err:
@@ -1146,6 +1253,7 @@ def chamada_iniciar():
 
 
 @bp.route("/api/cobranca/chamadas/<int:cod_chamada>/finalizar", methods=["PUT"])
+@_exige_operador
 def chamada_finalizar(cod_chamada):
     """Fecha a chamada, grava o desfecho por título e CALCULA A RÉGUA.
 
@@ -1310,6 +1418,7 @@ def chamada_finalizar(cod_chamada):
 
 
 @bp.route("/api/cobranca/chamadas/<int:cod_chamada>/cancelar", methods=["POST"])
+@_exige_operador
 def chamada_cancelar(cod_chamada):
     """Descarta a chamada e LIBERA A TRAVA (operador fechou o modal sem registrar)."""
     conexao = None
@@ -1367,6 +1476,7 @@ def chamada_cancelar(cod_chamada):
 
 
 @bp.route("/api/cobranca/chamadas/<int:cod_chamada>/renovar", methods=["PUT"])
+@_exige_operador
 def chamada_renovar(cod_chamada):
     """Heartbeat do modal aberto: empurra a expiração da trava por mais 15 min.
 
@@ -1449,14 +1559,15 @@ def chamada_renovar(cod_chamada):
 
 
 @bp.route("/api/cobranca/chamadas/<int:cod_chamada>/anexos", methods=["POST"])
+@_exige_operador
 def chamada_anexo(cod_chamada):
     """Anexa um LINK (drive da empresa) à chamada. Não guardamos arquivo.
 
-    Body: { url, descricao?, codUsu }
+    Body: { url, descricao? }
     """
     data = request.get_json(silent=True) or {}
+    cod_usu = request.operador["codUsu"]
     try:
-        cod_usu = _obrig_int(data, "codUsu")
         url = str(data.get("url") or "").strip()
         if not url:
             raise _Invalido("Parâmetro 'url' é obrigatório.")
@@ -1692,16 +1803,24 @@ def locks():
 
 @bp.route("/api/cobranca/regua", methods=["GET"])
 def regua():
-    """Posição na régua de cada título do cliente (badge 1ª/2ª/3ª chamada).
+    """Posição de cada título na régua (badge 1ª/2ª/3ª chamada).
 
-    Query: ?codParc=<int>
+    Query: ?codParc=<int> (opcional — sem ele, devolve a carteira inteira)
     Conta só chamadas PROATIVA + FINALIZADA — receptiva não empurra pro jurídico.
     `podeJuridico` = ordemAtual >= 3 (o envio em si continua manual).
     """
-    try:
-        cod_parc = _obrig_int(request.args, "codParc")
-    except _Invalido as err:
-        return jsonify({"erro": str(err)}), 400
+    # codParc é OPCIONAL: a tela de Títulos Vencidos mostra a carteira inteira e
+    # precisa dos badges de todos os clientes de uma vez. Sem filtro, a consulta
+    # devolve só os títulos que JÁ tiveram chamada proativa finalizada — um
+    # subconjunto pequeno da carteira, não a base toda.
+    cod_parc = request.args.get("codParc")
+    if cod_parc not in (None, ""):
+        try:
+            cod_parc = _obrig_int(request.args, "codParc")
+        except _Invalido as err:
+            return jsonify({"erro": str(err)}), 400
+    else:
+        cod_parc = None
 
     conexao = None
     try:
@@ -1712,10 +1831,11 @@ def regua():
         cursor = conexao.cursor()
         cursor.execute(
             """
-            SELECT NUFIN, ORDEMATUAL, DHULTIMA, DESFECHO, CODCHAMADA
+            SELECT NUFIN, CODPARC, ORDEMATUAL, DHULTIMA, DESFECHO, CODCHAMADA
             FROM (
                 SELECT i.NUFIN,
                        i.DESFECHO,
+                       c.CODPARC,
                        c.CODCHAMADA,
                        COUNT(*)     OVER (PARTITION BY i.NUFIN) AS ORDEMATUAL,
                        MAX(c.DHFIM) OVER (PARTITION BY i.NUFIN) AS DHULTIMA,
@@ -1725,9 +1845,9 @@ def regua():
                        ) AS RN
                 FROM AD_COBRCHAMADAITEM i
                 JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
-                WHERE c.CODPARC = :CODPARC
-                  AND c.SENTIDO = 'PROATIVA'
+                WHERE c.SENTIDO = 'PROATIVA'
                   AND c.SITUACAO = 'FINALIZADA'
+                  AND (:CODPARC IS NULL OR c.CODPARC = :CODPARC)
             ) WHERE RN = 1
             ORDER BY NUFIN
             """,
@@ -1735,14 +1855,15 @@ def regua():
         )
         dados = []
         for r in cursor.fetchall():
-            ordem = int(r[1] or 0)
+            ordem = int(r[2] or 0)
             dados.append(
                 {
                     "nufin": int(r[0]),
+                    "codParc": int(r[1]) if r[1] is not None else None,
                     "ordemAtual": ordem,
-                    "dhUltima": _dh(r[2]),
-                    "ultimoDesfecho": _txt(r[3]),
-                    "codChamada": int(r[4]),
+                    "dhUltima": _dh(r[3]),
+                    "ultimoDesfecho": _txt(r[4]),
+                    "codChamada": int(r[5]),
                     "podeJuridico": ordem >= 3,
                 }
             )
