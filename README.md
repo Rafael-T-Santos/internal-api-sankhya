@@ -8,6 +8,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
 |---|---|
 | [app.py](app.py) | Produtos, logística, contagem de estoque — e o registro dos blueprints |
 | [cobranca.py](cobranca.py) | Blueprint da Cobrança: listas de apoio, inadimplência, Visão 360°, login do operador e a régua de chamadas |
+| [drive.py](drive.py) | Envio dos anexos de cobrança para o Google Drive da empresa |
 | [impostos.py](impostos.py) | Recálculo de impostos via Gateway do Sankhya (`autenticar_sankhya` é reaproveitada pela cobrança) |
 | [db.py](db.py) | `conectar_oracle()` — única função de conexão |
 
@@ -85,6 +86,29 @@ Para a sessão do operador na régua de chamadas:
 | `COBRANCA_SECRET` | Chave que assina os tokens de sessão. Qualquer string longa e aleatória — ex.: `python -c "import secrets;print(secrets.token_urlsafe(48))"` |
 
 **Opcional, mas defina no servidor.** Sem ela cada processo sorteia o próprio segredo ao subir, e todo `docker compose up` desloga os operadores no meio do expediente.
+
+Para o envio de anexos ao Google Drive ([`drive.py`](drive.py)):
+
+| Variável | Descrição |
+|---|---|
+| `GOOGLE_CLIENT_ID` | ID do cliente OAuth (tipo *App para computador*) |
+| `GOOGLE_CLIENT_SECRET` | Segredo do mesmo cliente |
+| `GOOGLE_REFRESH_TOKEN` | Credencial de longa duração, obtida uma única vez |
+| `GOOGLE_DRIVE_FOLDER_ID` | Pasta de destino (o trecho do link depois de `/folders/`) |
+
+A conta do Drive é um **Gmail comum**, não Workspace. Isso descarta conta de serviço: ela não tem espaço próprio no Drive e o upload falharia com `storageQuotaExceeded`. O caminho é autorizar o app uma vez pelo navegador e guardar o *refresh token*:
+
+```
+pip install google-auth-oauthlib google-api-python-client
+python scripts/autorizar-drive.py --client-id XXX --client-secret YYY
+```
+
+O script abre o navegador, pede a aprovação, imprime o refresh token e **testa a pasta de verdade** (sobe, compartilha, mostra o link e apaga).
+
+Dois detalhes que quebram isso silenciosamente:
+
+- **A tela de permissão OAuth precisa estar "Em produção".** Em "Testes", o Google expira o refresh token em **7 dias** — os anexos param de funcionar na semana seguinte, sem erro óbvio.
+- O escopo é `drive.file`: acesso **só aos arquivos que este app cria**, nunca ao resto do Drive da conta. Se um dia a pasta de destino mudar para uma criada à mão no navegador, o app pode não enxergá-la — rode o script de novo apontando para ela e veja o que ele responde.
 
 O `.env` é lido pelo `docker-compose` e está no `.gitignore` — **nunca commite credenciais**.
 
@@ -670,13 +694,30 @@ Descarta a chamada (`SITUACAO = CANCELADA`, `DHFIM = SYSDATE`) e libera a trava.
 
 Heartbeat do modal aberto: empurra `DHEXPIRA` por mais 15 min → `{ "dhExpira": "..." }`. Devolve `409` se a trava já expirou **e** outro operador assumiu algum título no intervalo — renovar não rouba a trava de quem chegou depois.
 
+#### `POST /api/cobranca/chamadas/{id}/anexos/arquivo`
+
+Sobe um **arquivo do computador do operador** para o Google Drive da empresa e guarda o link na chamada. `multipart/form-data` com o campo `arquivo` (obrigatório) e `descricao` (opcional).
+
+```jsonc
+// 201
+{ "sucesso": true, "codAnexo": 12, "codChamada": 41,
+  "descricao": "boleto.pdf",
+  "url": "https://drive.google.com/file/d/1RmZ…/view?usp=drivesdk" }
+```
+
+Limite de **25 MB** (`drive.LIMITE_BYTES`) → `413`. Sem as variáveis do Drive no ambiente → `503`. Falha do lado do Google → `502`.
+
+O arquivo vai para o Drive **antes** do `INSERT`. Se fosse ao contrário, um erro no meio deixaria uma linha no banco apontando para um arquivo que não existe; nesta ordem, o pior caso é um arquivo órfão no Drive — que não quebra a tela de ninguém.
+
+O nome no Drive recebe o prefixo `chamada-{id}-`, para quem abrir a pasta meses depois conseguir ligar o arquivo ao atendimento.
+
 #### `POST /api/cobranca/chamadas/{id}/anexos`
 
-Anexa um **link** (drive da empresa) à chamada — não guardamos arquivo.
+Anexa um **link já existente**, sem subir nada. É a rota antiga; o app usa a de cima.
 
 ```jsonc
 // Request → 201 { "codAnexo": 12, ... }
-{ "url": "https://drive.empresa.com/x/boleto.pdf", "descricao": "Boleto renegociado" }
+{ "url": "https://drive.google.com/…", "descricao": "Boleto renegociado" }
 ```
 
 A `url` precisa começar com `http://` ou `https://` (o app abre o link direto; aceitar `javascript:` seria execução de script vinda de um campo de texto). `409` se a chamada foi cancelada.

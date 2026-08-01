@@ -193,6 +193,39 @@ Passo 5.1 "POST /anexos com javascript: -> 400"
 $r51 = Chamar POST "/api/cobranca/chamadas/$cod/anexos" @{ url = "javascript:alert(1)" }
 if ($r51.status -eq 400) { Ok "400: $($r51.corpo.erro)" } else { Falha "esperava 400, veio $($r51.status)" }
 
+Passo 5.2 "POST /anexos/arquivo (upload de verdade no Google Drive)"
+# Invoke-WebRequest do PS 5.1 nao monta multipart sozinho; montamos a mao.
+$limite = [System.Guid]::NewGuid().ToString()
+$conteudo = "anexo de teste gerado pelo smoke test em $(Get-Date -Format s)"
+$corpoMultipart = (
+  "--$limite",
+  'Content-Disposition: form-data; name="arquivo"; filename="teste-cobranca.txt"',
+  "Content-Type: text/plain",
+  "",
+  $conteudo,
+  "--$limite",
+  'Content-Disposition: form-data; name="descricao"',
+  "",
+  "Anexo do smoke test",
+  "--$limite--",
+  ""
+) -join "`r`n"
+try {
+  $up = Invoke-WebRequest -Uri "$Base/api/cobranca/chamadas/$cod/anexos/arquivo" -Method POST `
+    -ContentType "multipart/form-data; boundary=$limite" `
+    -Headers @{ Authorization = "Bearer $Token" } -Body $corpoMultipart -UseBasicParsing -TimeoutSec 120
+  $upJson = $up.Content | ConvertFrom-Json
+  if ($upJson.url -like "https://drive.google.com/*") {
+    Ok "subiu no Drive -> $($upJson.url)"
+  } else { Falha "URL inesperada: $($upJson.url)" }
+} catch {
+  $st = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { "?" }
+  $det = $_.ErrorDetails.Message
+  if ($st -eq 503) {
+    Write-Host "    PULADO - Drive nao configurado neste servidor ($det)" -ForegroundColor DarkYellow
+  } else { Falha "upload falhou ($st): $det" }
+}
+
 # --- 6) finalizar com desfecho DIFERENTE por titulo ------------------------
 Passo 6 "PUT /finalizar (ACORDO no 1o titulo, SEM_ACORDO no 2o)"
 $r6 = Chamar PUT "/api/cobranca/chamadas/$cod/finalizar" @{
@@ -235,8 +268,8 @@ if ($geral -and $geral.codParc -eq $CodParc) {
 Passo 7.2 "GET /chamadas (historico com itens e anexos, URL vem de CLOB)"
 $r72 = Chamar GET "/api/cobranca/chamadas?codParc=$CodParc"
 $hist = $r72.corpo.dados | Where-Object { $_.codChamada -eq $cod }
-if ($hist -and $hist.itens.Count -eq 2 -and $hist.anexos.Count -eq 1 -and $hist.anexos[0].url -like "https://*") {
-  Ok "chamada ${cod}: $($hist.itens.Count) itens, anexo -> $($hist.anexos[0].url)"
+if ($hist -and $hist.itens.Count -eq 2 -and $hist.anexos.Count -ge 1 -and $hist.anexos[0].url -like "https://*") {
+  Ok "chamada ${cod}: $($hist.itens.Count) itens, $($hist.anexos.Count) anexo(s), 1o -> $($hist.anexos[0].url)"
 } else { Falha "historico incompleto: $($hist | ConvertTo-Json -Depth 4 -Compress)" }
 
 # --- 8) receptiva NAO conta na regua ---------------------------------------

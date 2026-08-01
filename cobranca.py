@@ -22,7 +22,9 @@ from urllib.parse import unquote
 import cx_Oracle
 import requests
 from flask import Blueprint, jsonify, request
+from werkzeug.utils import secure_filename
 
+import drive
 from db import conectar_oracle
 # Reaproveita a autenticação de aplicação (OAuth client_credentials) e a base do
 # Gateway já usadas no recálculo de impostos. O README marca essas funções como
@@ -1558,29 +1560,8 @@ def chamada_renovar(cod_chamada):
             conexao.close()
 
 
-@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/anexos", methods=["POST"])
-@_exige_operador
-def chamada_anexo(cod_chamada):
-    """Anexa um LINK (drive da empresa) à chamada. Não guardamos arquivo.
-
-    Body: { url, descricao? }
-    """
-    data = request.get_json(silent=True) or {}
-    cod_usu = request.operador["codUsu"]
-    try:
-        url = str(data.get("url") or "").strip()
-        if not url:
-            raise _Invalido("Parâmetro 'url' é obrigatório.")
-        # O app abre esse link direto; aceitar 'javascript:' seria abrir a porta
-        # para execução de script a partir de um campo de texto.
-        if not url.lower().startswith(("http://", "https://")):
-            raise _Invalido("'url' deve começar com http:// ou https://.")
-        if len(url) > 2000:
-            raise _Invalido("'url' excede 2000 caracteres.")
-        descricao = (str(data.get("descricao") or "").strip())[:100] or None
-    except _Invalido as err:
-        return jsonify({"erro": str(err)}), 400
-
+def _gravar_anexo(cod_chamada, descricao, url, cod_usu):
+    """Insere o anexo e devolve a resposta pronta (compartilhado pelas 2 rotas)."""
     conexao = None
     try:
         conexao = conectar_oracle()
@@ -1644,6 +1625,79 @@ def chamada_anexo(cod_chamada):
     finally:
         if conexao:
             conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/anexos", methods=["POST"])
+@_exige_operador
+def chamada_anexo(cod_chamada):
+    """Anexa um LINK já existente à chamada (não sobe arquivo nenhum).
+
+    Body: { url, descricao? }
+    Para mandar um arquivo do computador, use /anexos/arquivo.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        url = str(data.get("url") or "").strip()
+        if not url:
+            raise _Invalido("Parâmetro 'url' é obrigatório.")
+        # O app abre esse link direto; aceitar 'javascript:' seria abrir a porta
+        # para execução de script a partir de um campo de texto.
+        if not url.lower().startswith(("http://", "https://")):
+            raise _Invalido("'url' deve começar com http:// ou https://.")
+        if len(url) > 2000:
+            raise _Invalido("'url' excede 2000 caracteres.")
+        descricao = (str(data.get("descricao") or "").strip())[:100] or None
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    return _gravar_anexo(cod_chamada, descricao, url, request.operador["codUsu"])
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/anexos/arquivo", methods=["POST"])
+@_exige_operador
+def chamada_anexo_arquivo(cod_chamada):
+    """Sobe um ARQUIVO do computador do operador para o Drive da empresa.
+
+    multipart/form-data: campo `arquivo` (obrigatório) e `descricao` (opcional).
+
+    O arquivo não fica aqui: vai para o Drive e o que guardamos é o link. A
+    ordem importa — sobe primeiro, grava depois. Se o INSERT falhasse antes do
+    upload, sobraria uma linha apontando para nada; do jeito inverso, o pior
+    caso é um arquivo órfão no Drive, que não quebra a tela de ninguém.
+    """
+    enviado = request.files.get("arquivo")
+    if not enviado or not enviado.filename:
+        return jsonify({"erro": "Envie o arquivo no campo 'arquivo'."}), 400
+
+    conteudo = enviado.read()
+    if not conteudo:
+        return jsonify({"erro": "Arquivo vazio."}), 400
+    if len(conteudo) > drive.LIMITE_BYTES:
+        return (
+            jsonify(
+                {
+                    "erro": f"Arquivo maior que o limite de "
+                    f"{drive.LIMITE_BYTES // (1024 * 1024)} MB."
+                }
+            ),
+            413,
+        )
+
+    nome = secure_filename(enviado.filename) or "anexo"
+    descricao = (request.form.get("descricao") or "").strip()[:100] or nome[:100]
+
+    try:
+        # Prefixo com o número da chamada: quem abrir a pasta do Drive daqui a
+        # seis meses consegue ligar o arquivo ao atendimento que o gerou.
+        subido = drive.enviar_arquivo(
+            f"chamada-{cod_chamada}-{nome}", enviado.mimetype, conteudo
+        )
+    except drive.DriveNaoConfigurado as err:
+        return jsonify({"erro": str(err)}), 503
+    except Exception as e:
+        return _erro(f"Falha ao enviar o arquivo para o Drive: {e}", 502)
+
+    return _gravar_anexo(cod_chamada, descricao, subido["url"], request.operador["codUsu"])
 
 
 @bp.route("/api/cobranca/chamadas", methods=["GET"])
