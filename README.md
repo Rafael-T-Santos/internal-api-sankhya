@@ -2,7 +2,14 @@
 
 API interna em Flask que expõe dados do ERP **Sankhya** (Oracle) para os sistemas da Neto Distribuidora.
 
-Todo o código vive em [app.py](app.py). Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devolve JSON. Não há ORM, não há camada de serviço, não há autenticação.
+Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devolve JSON. Não há ORM, não há camada de serviço, não há autenticação de rede.
+
+| Arquivo | O que tem |
+|---|---|
+| [app.py](app.py) | Produtos, logística, contagem de estoque — e o registro dos blueprints |
+| [cobranca.py](cobranca.py) | Blueprint da Cobrança: listas de apoio, inadimplência, Visão 360°, login do operador e a régua de chamadas |
+| [impostos.py](impostos.py) | Recálculo de impostos via Gateway do Sankhya (`autenticar_sankhya` é reaproveitada pela cobrança) |
+| [db.py](db.py) | `conectar_oracle()` — única função de conexão |
 
 ---
 
@@ -16,6 +23,8 @@ Todo o código vive em [app.py](app.py). Cada endpoint abre sua própria conexã
   - [Logística](#logística)
   - [Contagem de estoque](#contagem-de-estoque)
   - [Cobrança](#cobrança)
+  - [Cobrança — operador](#cobrança--operador)
+  - [Cobrança — régua de chamadas (escrita)](#cobrança--régua-de-chamadas-escrita)
 - [Constantes hardcoded](#constantes-hardcoded)
 - [Tabelas do Sankhya usadas](#tabelas-do-sankhya-usadas)
 - [Limitações conhecidas](#limitações-conhecidas)
@@ -525,6 +534,149 @@ A coluna `situacao` traduz esses casos em texto: `CHEQUE DEVOLVIDO PENDENTE`, `C
 
 ---
 
+#### `POST /api/cobranca/cliente`
+
+Identificação + KPIs do cliente para o topo da Visão 360°. Body: `{ "codParc": 100 }`. Devolve `404` se o parceiro não existe.
+
+```jsonc
+{ "sucesso": true, "dados": {
+  "codParc": 100, "nomeParc": "CLIENTE X", "razaoSocial": "CLIENTE X LTDA",
+  "cgcCpf": "12345678000199", "telefone": "81999998888", "email": null,
+  "limiteCredito": 5000.0, "ativo": "S", "nomeCid": "RECIFE", "uf": "PE",
+  "vendedor": "CARLOS", "pontualidade": 87.5, "titulosQuitados12m": 40 } }
+```
+
+`pontualidade` é `null` (e não `0`) quando não há título quitado nos últimos 12 meses — sem histórico não é o mesmo que mau pagador.
+
+#### `POST /api/cobranca/extrato`
+
+Todos os títulos em aberto do cliente — **vencidos e a vencer**. Body: `{ "codParc": 100 }`. Mesmas regras de cheque de `/api/receitas-vencidas` (para cheque, a data que vale é o "bom para", `TGFCHQ.DATACHEQUE`).
+
+---
+
+### Cobrança — operador
+
+#### `POST /api/cobranca/login`
+
+Autentica o operador. Body: `{ "usuario": "<NOMEUSU>", "senha": "..." }` → `{ "sucesso": true, "codUsu": 7, "nomeUsu": "FULANO" }`; `401` com credencial inválida.
+
+**A senha não é conferida no Oracle.** Quem valida é o próprio Sankhya, pelo serviço `MobileLoginSP.login` chamado via Gateway (o hash da `TSIUSU` é proprietário e reproduzi-lo aqui seria frágil). Validada a senha, o `CODUSU` é resolvido na `TSIUSU` por `UPPER(NOMEUSU)`.
+
+#### `GET /api/cobranca/operadores`
+
+Lista `CODUSU`/`NOMEUSU` da `TSIUSU`, sem filtro de status — um usuário já desativado ainda precisa ser resolvido para exibir "quem ligou" numa chamada antiga.
+
+---
+
+### Cobrança — régua de chamadas (escrita)
+
+Grava em três tabelas customizadas: `AD_COBRCHAMADA` (cabeçalho), `AD_COBRCHAMADAITEM` (títulos da chamada — **a régua vive aqui**) e `AD_COBRANEXO` (links).
+
+**Como o PK é gerado:** por **sequences dedicadas** (`SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM`, `SEQ_AD_COBRANEXO`) + `RETURNING`. Não é o padrão `TGFNUM` usado em [cadastrar-produto](#post-apicadastrar-produto): o "autoincremento" marcado no Sankhya só age em INSERTs feitos pela camada dele (DynaForm/DatasetSP), e essas tabelas não estão registradas na `TGFNUM` — gravando direto no Oracle, o PK viria nulo.
+
+**Regras que moram na API** (o React não decide nada disso):
+
+| Regra | Implementação |
+|---|---|
+| Régua conta **por título**, não por cliente | `ORDEM` fica no item (`NUFIN`), não no cabeçalho |
+| Chamada **receptiva não conta** na régua | Só `SENTIDO = PROATIVA` + `SITUACAO = FINALIZADA` incrementa `ORDEM` |
+| Trava "em chamada" | Derivada: existe item cuja chamada está `EM_ANDAMENTO` **e** `DHEXPIRA > SYSDATE`. Sem campo em `TGFFIN` |
+| Trava expira sozinha (15 min) | Toda consulta de trava filtra por `DHEXPIRA` — modal abandonado libera o título |
+| Jurídico na 3ª chamada é **opcional** | A API só marca `podeJuridico` quando `ordemAtual >= 3`; o envio é manual |
+
+Domínios aceitos: `sentido` = `PROATIVA`/`RECEPTIVA`; `status` = `ATENDEU`/`CAIXA_POSTAL`/`RECUSOU`/`AGENDOU`; `desfecho` = `ACORDO`/`SEM_ACORDO`/`EM_ABERTO`. Valor fora do domínio → `400`.
+
+> As colunas foram criadas quase todas **nullable** no Sankhya. Quem impõe a obrigatoriedade é esta API, não o banco.
+
+#### `POST /api/cobranca/chamadas/iniciar`
+
+Abre a chamada (rascunho `EM_ANDAMENTO`) e **adquire a trava** dos títulos.
+
+```jsonc
+// Request
+{ "codParc": 100, "nufins": [987654, 987655], "sentido": "PROATIVA", "codUsu": 7 }
+```
+
+```jsonc
+// 201
+{ "sucesso": true, "codChamada": 41, "codParc": 100, "sentido": "PROATIVA",
+  "dhInicio": "2026-08-01 09:12:00", "dhExpira": "2026-08-01 09:27:00",
+  "nufins": [987654, 987655] }
+```
+
+```jsonc
+// 409 — alguém já está em chamada com o título
+{ "erro": "Título já está em chamada por FULANO.",
+  "nufinsTravados": [ { "nufin": 987654, "codChamada": 40, "codParc": 100,
+                        "codUsu": 9, "nomeUsu": "FULANO",
+                        "desde": "2026-08-01 09:05:00",
+                        "expiraEm": "2026-08-01 09:20:00" } ] }
+```
+
+Outros erros: `404` título inexistente, `400` título de outro cliente ou mais de 200 títulos numa chamada.
+
+**Concorrência:** antes de checar a trava, a rota faz `SELECT ... FROM TGFFIN ... FOR UPDATE WAIT 5` nos títulos. Sem isso, dois operadores que clicassem no mesmo instante passariam os dois pela checagem (nenhum enxerga o INSERT não commitado do outro). Esgotar a espera (`ORA-00054`) ou dar deadlock (`ORA-00060`) devolve `409`, não `500`.
+
+#### `PUT /api/cobranca/chamadas/{id}/finalizar`
+
+Fecha a chamada, grava o desfecho **por título** e calcula a régua.
+
+```jsonc
+// Request — dhAgenda é obrigatório quando status = AGENDOU
+{ "status": "ATENDEU", "resumo": "Prometeu pagar sexta.",
+  "dhAgenda": null,
+  "itens": [ { "nufin": 987654, "desfecho": "ACORDO" },
+             { "nufin": 987655, "desfecho": "SEM_ACORDO" } ] }
+```
+
+```jsonc
+// 200 — ordem = null quando a chamada é RECEPTIVA
+{ "sucesso": true, "codChamada": 41, "sentido": "PROATIVA", "status": "ATENDEU",
+  "itens": [ { "nufin": 987654, "ordem": 3, "desfecho": "ACORDO" },
+             { "nufin": 987655, "ordem": 1, "desfecho": "SEM_ACORDO" } ] }
+```
+
+`409` se a chamada já está `FINALIZADA`/`CANCELADA`; `400` se algum `nufin` do payload não pertence à chamada. **Trava expirada não impede finalizar** — a expiração serve para liberar o título para outros, não para descartar o que o operador digitou.
+
+#### `POST /api/cobranca/chamadas/{id}/cancelar`
+
+Descarta a chamada (`SITUACAO = CANCELADA`, `DHFIM = SYSDATE`) e libera a trava. **Idempotente**: cancelar uma chamada já cancelada devolve `200`, porque o front cancela no fechar do modal e de novo no unload da aba.
+
+#### `PUT /api/cobranca/chamadas/{id}/renovar`
+
+Heartbeat do modal aberto: empurra `DHEXPIRA` por mais 15 min → `{ "dhExpira": "..." }`. Devolve `409` se a trava já expirou **e** outro operador assumiu algum título no intervalo — renovar não rouba a trava de quem chegou depois.
+
+#### `POST /api/cobranca/chamadas/{id}/anexos`
+
+Anexa um **link** (drive da empresa) à chamada — não guardamos arquivo.
+
+```jsonc
+// Request → 201 { "codAnexo": 12, ... }
+{ "url": "https://drive.empresa.com/x/boleto.pdf", "descricao": "Boleto renegociado", "codUsu": 7 }
+```
+
+A `url` precisa começar com `http://` ou `https://` (o app abre o link direto; aceitar `javascript:` seria execução de script vinda de um campo de texto). `409` se a chamada foi cancelada.
+
+#### `GET /api/cobranca/chamadas?codParc=100[&limite=100]`
+
+Histórico do cliente: cabeçalho + `itens` (com `ordem` e `desfecho`) + `anexos`, mais recente primeiro. `limite` entre 1 e 500 (padrão 100).
+
+#### `GET /api/cobranca/locks[?nufins=1,2,3]`
+
+Títulos em chamada **neste momento** (alimenta o badge "em chamada por..."). Sem `nufins`, devolve todas as travas ativas — são poucas por natureza (uma por título aberto num modal), então o filtro é aplicado em memória e a tela não precisa mandar centenas de `NUFIN` na query string.
+
+#### `GET /api/cobranca/regua?codParc=100`
+
+Posição de cada título do cliente na régua (badge 1ª/2ª/3ª chamada).
+
+```jsonc
+{ "sucesso": true, "totalRegistros": 1, "dados": [
+  { "nufin": 987654, "ordemAtual": 3, "dhUltima": "2026-08-01 09:20:00",
+    "ultimoDesfecho": "SEM_ACORDO", "codChamada": 41, "podeJuridico": true } ] }
+```
+
+---
+
 ## Constantes hardcoded
 
 Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis** hoje. Se a regra de negócio mudar, é aqui que se mexe:
@@ -541,6 +693,9 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 | `CODTIPOPER 1657` | [receitas-vencidas](app.py#L1105) | Operação de cheque devolvido |
 | `CODCTABCOINT 16` | [receitas-vencidas](app.py#L1107) | Conta em que cheque baixado ainda é pendência |
 | `CODTIPTIT 3 / 4, 5, 39` | [receitas-vencidas](app.py#L1138) | `3` = cheque; demais = títulos |
+| `_TRAVA_MINUTOS = 15` | [cobranca.py](cobranca.py) | Duração da trava "em chamada"; modal abandonado libera o título depois disso |
+| `_MAX_TITULOS_CHAMADA = 200` | [cobranca.py](cobranca.py) | Teto de títulos por chamada — um "selecionar tudo" acidental não trava a carteira inteira |
+| `WAIT 5` | [chamadas/iniciar](cobranca.py) | Espera máxima pelo lock em `TGFFIN`; estourar vira `409`, não `500` |
 
 ---
 
@@ -548,7 +703,9 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 
 **Padrão:** `TGFPRO` (produtos), `TGFICP` (composição/fórmula), `TGFPEM` (produto × empresa), `TGFFCP`/`TGFEPR` (tributação), `TGFNUM` (numeração), `TGFTAB`/`TGFEXC` (tabelas de preço), `TGFICM` (ICMS/ST), `TGFEST` (estoque), `TGFCAB`/`TGFITE` (notas), `TGFTOP` (operações), `TGFORD`/`TGFVEI` (ordem de carga/veículos), `TGFPAR` (parceiros), `TGFVEN` (vendedores), `TGFFIN`/`VGFFIN` (financeiro), `TGFTIT` (tipos de título), `TGFOBS` (observações), `TGFMAR` (marcas), `TSICID`/`TSIEND`/`TSIBAI`/`TSIUFS` (endereços), `TSIEMP` (empresas), `TSICTA` (contas bancárias).
 
-**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca).
+Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
+
+**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
 
@@ -560,7 +717,7 @@ Além do Oracle, as rotas [`/api/cadastrar-produto`](#post-apicadastrar-produto)
 
 Nada disso é bug novo — é o estado atual, documentado para quem for mexer:
 
-- **Sem autenticação.** Qualquer um com acesso de rede chama qualquer rota, inclusive as que gravam (`/api/cadastrar-produto`, `/api/registrar-contagem`). A API depende inteiramente de estar em rede fechada.
+- **Sem autenticação.** Qualquer um com acesso de rede chama qualquer rota, inclusive as que gravam (`/api/cadastrar-produto`, `/api/registrar-contagem`, `/api/cobranca/chamadas/*`). A API depende inteiramente de estar em rede fechada. O `/api/cobranca/login` autentica o **operador** (para saber quem ligou), não a chamada HTTP: o `codUsu` chega no body e não é verificado contra uma sessão.
 - **CORS liberado para qualquer origem** (`CORS(app)` sem restrição).
 - **Servidor de desenvolvimento.** O container roda `flask run`, não um WSGI de produção (gunicorn/waitress). Single-threaded e não recomendado para carga real.
 - **Uma conexão nova por request**, aberta e fechada a cada chamada — sem pool. Sob concorrência, isso vira gargalo no Oracle.

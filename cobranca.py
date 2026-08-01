@@ -8,6 +8,7 @@ Os paths das 4 rotas antigas foram preservados (/api/cidades, /api/vendedores,
 As rotas novas ficam sob /api/cobranca/*.
 """
 
+from datetime import datetime
 from urllib.parse import unquote
 
 import cx_Oracle
@@ -827,6 +828,925 @@ def operadores():
             """
         )
         dados = [{"codUsu": int(r[0]), "nomeUsu": _txt(r[1])} for r in cursor.fetchall()]
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+# ===========================================================================
+# RÉGUA DE CHAMADAS — primeira ESCRITA do módulo de cobrança
+#
+# Tabelas (criadas no Sankhya pelo Construtor de Telas):
+#   AD_COBRCHAMADA      cabeçalho da chamada (cliente, sentido, situação, trava)
+#   AD_COBRCHAMADAITEM  títulos da chamada — a RÉGUA POR TÍTULO vive aqui (ORDEM)
+#   AD_COBRANEXO        anexos (só o link do drive; não guardamos arquivo)
+#
+# PK: as três tabelas usam SEQUENCES DEDICADAS (SEQ_AD_COBRCHAMADA,
+# SEQ_AD_COBRCHAMADAITEM, SEQ_AD_COBRANEXO) + RETURNING. NÃO usar o padrão
+# TGFNUM daqui: o "autoincremento" que se marca no Sankhya só age em INSERTs
+# feitos pela camada dele (DynaForm/DatasetSP) e a TGFNUM não tem registro
+# dessas tabelas — gravando direto no Oracle, o PK viria nulo.
+#
+# Regras que moram AQUI (nunca no React):
+#   - Régua do título = nº de itens de chamadas PROATIVA + FINALIZADA daquele
+#     NUFIN. Chamada RECEPTIVA entra no histórico mas NÃO incrementa a ORDEM.
+#   - Trava "em chamada" = existe item cuja chamada está EM_ANDAMENTO e
+#     DHEXPIRA > agora. É derivada (sem campo em TGFFIN) e expira sozinha:
+#     toda consulta de trava filtra por DHEXPIRA, então modal abandonado libera.
+#   - Obrigatoriedade de campo: o pessoal criou as colunas quase todas
+#     NULLABLE, então quem impõe o preenchimento é esta API.
+# ===========================================================================
+
+# Duração da trava do título enquanto o modal está aberto.
+_TRAVA_MINUTOS = 15
+# Teto de títulos por chamada — evita que um clique errado ("selecionar tudo")
+# trave a carteira inteira do cliente.
+_MAX_TITULOS_CHAMADA = 200
+
+_SENTIDOS = ("PROATIVA", "RECEPTIVA")
+_STATUS_CHAMADA = ("ATENDEU", "CAIXA_POSTAL", "RECUSOU", "AGENDOU")
+_DESFECHOS = ("ACORDO", "SEM_ACORDO", "EM_ABERTO")
+
+# Travas ativas. Sem filtro de título: quem chama acrescenta o IN quando precisa.
+SQL_TRAVAS = """
+    SELECT i.NUFIN, c.CODCHAMADA, c.CODPARC, c.CODUSU, u.NOMEUSU,
+           c.DHINICIO, c.DHEXPIRA
+    FROM AD_COBRCHAMADAITEM i
+    JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+    LEFT JOIN TSIUSU u ON u.CODUSU = c.CODUSU
+    WHERE c.SITUACAO = 'EM_ANDAMENTO'
+      AND c.DHEXPIRA > SYSDATE
+"""
+
+
+class _Invalido(Exception):
+    """Payload recusado — vira 400. Não é erro de servidor."""
+
+
+def _obrig_int(dados, campo):
+    valor = dados.get(campo)
+    if valor is None or valor == "":
+        raise _Invalido(f"Parâmetro '{campo}' é obrigatório.")
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        raise _Invalido(f"Parâmetro '{campo}' deve ser um número inteiro.")
+
+
+def _obrig_dominio(dados, campo, valores):
+    valor = str(dados.get(campo) or "").strip().upper()
+    if valor not in valores:
+        raise _Invalido(f"Parâmetro '{campo}' deve ser um de: {', '.join(valores)}.")
+    return valor
+
+
+def _lista_nufins(dados, campo="nufins"):
+    bruto = dados.get(campo)
+    if not isinstance(bruto, (list, tuple)) or not bruto:
+        raise _Invalido(f"'{campo}' deve ser uma lista com ao menos um título.")
+    nufins = []
+    for item in bruto:
+        try:
+            nufin = int(item)
+        except (TypeError, ValueError):
+            raise _Invalido(f"'{campo}' contém um valor não numérico: {item!r}.")
+        if nufin not in nufins:  # duplicado no payload não vira item duplicado
+            nufins.append(nufin)
+    if len(nufins) > _MAX_TITULOS_CHAMADA:
+        raise _Invalido(
+            f"Uma chamada aceita no máximo {_MAX_TITULOS_CHAMADA} títulos "
+            f"(recebidos {len(nufins)})."
+        )
+    return nufins
+
+
+def _parse_dh(valor, campo):
+    """Aceita 'YYYY-MM-DD HH:MM[:SS]', o ISO com 'T' do <input datetime-local>
+    e só a data (vira meia-noite)."""
+    if valor in (None, ""):
+        return None
+    texto = str(valor).strip().replace("T", " ")
+    for formato in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(texto, formato)
+        except ValueError:
+            continue
+    raise _Invalido(f"'{campo}' deve estar no formato YYYY-MM-DD HH:MM.")
+
+
+def _dh(valor):
+    return valor.strftime("%Y-%m-%d %H:%M:%S") if valor else None
+
+
+def _binds_lista(prefixo, valores):
+    """Placeholders de um IN (...) + o dict de binds (cx_Oracle não aceita lista)."""
+    nomes = [f"{prefixo}{i}" for i in range(len(valores))]
+    return ", ".join(f":{n}" for n in nomes), dict(zip(nomes, valores))
+
+
+def _novo_id(cursor, sql, binds):
+    """INSERT com RETURNING <pk> INTO :ID — devolve o PK gerado pela sequence."""
+    var = cursor.var(cx_Oracle.NUMBER)
+    cursor.execute(sql, dict(binds, ID=var))
+    valor = var.getvalue()
+    if isinstance(valor, list):  # cx_Oracle 8 devolve lista no DML returning
+        valor = valor[0]
+    return int(valor)
+
+
+def _texto_lob(valor):
+    """AD_COBRANEXO.URL é CLOB: a leitura devolve um LOB, não uma string."""
+    if valor is not None and hasattr(valor, "read"):
+        valor = valor.read()
+    return _txt(valor)
+
+
+def _linha_trava(r):
+    return {
+        "nufin": int(r[0]),
+        "codChamada": int(r[1]),
+        "codParc": int(r[2]) if r[2] is not None else None,
+        "codUsu": int(r[3]) if r[3] is not None else None,
+        "nomeUsu": _txt(r[4]),
+        "desde": _dh(r[5]),
+        "expiraEm": _dh(r[6]),
+    }
+
+
+def _erro_oracle(err):
+    """ORA-00054 (espera de lock esgotada) e ORA-00060 (deadlock) não são falha
+    de servidor: são dois operadores disputando o mesmo título. Viram 409."""
+    codigo = None
+    if err.args and hasattr(err.args[0], "code"):
+        codigo = err.args[0].code
+    if codigo in (54, 60):
+        return (
+            jsonify(
+                {
+                    "erro": "Outro operador está registrando chamada nestes títulos "
+                    "neste instante. Tente novamente."
+                }
+            ),
+            409,
+        )
+    return _erro(f"Erro de Banco de Dados: {err}")
+
+
+@bp.route("/api/cobranca/chamadas/iniciar", methods=["POST"])
+def chamada_iniciar():
+    """Abre a chamada e ADQUIRE A TRAVA dos títulos.
+
+    Body: { codParc, nufins: [..], sentido: PROATIVA|RECEPTIVA, codUsu }
+    201:  { codChamada, dhInicio, dhExpira, nufins }
+    409:  { nufinsTravados: [{nufin, nomeUsu, desde, ...}] }
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        cod_parc = _obrig_int(data, "codParc")
+        cod_usu = _obrig_int(data, "codUsu")
+        sentido = _obrig_dominio(data, "sentido", _SENTIDOS)
+        nufins = _lista_nufins(data)
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        placeholders, binds = _binds_lista("N", nufins)
+
+        # 1) Serializa a disputa travando as linhas dos títulos em TGFFIN.
+        #    Sem isso, dois operadores que clicam no mesmo instante passariam os
+        #    dois pelo teste do passo 2 (nenhum enxerga o INSERT não commitado do
+        #    outro) e o título ficaria travado em duplicidade. O lock dura o
+        #    tempo dos INSERTs; WAIT 5 impede ficarmos pendurados numa transação
+        #    longa do próprio Sankhya. De quebra, valida a existência do título.
+        cursor.execute(
+            f"""
+            SELECT NUFIN, CODPARC
+            FROM TGFFIN
+            WHERE NUFIN IN ({placeholders})
+            ORDER BY NUFIN
+            FOR UPDATE WAIT 5
+            """,
+            binds,
+        )
+        achados = {
+            int(r[0]): (int(r[1]) if r[1] is not None else None)
+            for r in cursor.fetchall()
+        }
+
+        faltando = [n for n in nufins if n not in achados]
+        if faltando:
+            conexao.rollback()
+            return jsonify({"erro": f"Títulos inexistentes: {faltando}"}), 404
+
+        de_outro = [n for n in nufins if achados[n] != cod_parc]
+        if de_outro:
+            conexao.rollback()
+            return (
+                jsonify(
+                    {
+                        "erro": f"Títulos {de_outro} não pertencem ao cliente {cod_parc}.",
+                        "nufinsInvalidos": de_outro,
+                    }
+                ),
+                400,
+            )
+
+        # 2) Nenhum dos títulos pode estar em chamada agora.
+        cursor.execute(SQL_TRAVAS + f" AND i.NUFIN IN ({placeholders})", binds)
+        travados = [_linha_trava(r) for r in cursor.fetchall()]
+        if travados:
+            conexao.rollback()
+            quem = travados[0].get("nomeUsu") or f"usuário {travados[0].get('codUsu')}"
+            return (
+                jsonify(
+                    {
+                        "erro": f"Título já está em chamada por {quem}.",
+                        "nufinsTravados": travados,
+                    }
+                ),
+                409,
+            )
+
+        # 3) Cabeçalho + itens. A chamada nasce EM_ANDAMENTO (rascunho): STATUS,
+        #    RESUMO e DESFECHO só chegam na finalização.
+        cod_chamada = _novo_id(
+            cursor,
+            """
+            INSERT INTO AD_COBRCHAMADA
+                (CODCHAMADA, CODPARC, SENTIDO, SITUACAO, DHINICIO, DHEXPIRA, CODUSU)
+            VALUES
+                (SEQ_AD_COBRCHAMADA.NEXTVAL, :CODPARC, :SENTIDO, 'EM_ANDAMENTO',
+                 SYSDATE, SYSDATE + :MINUTOS / 1440, :CODUSU)
+            RETURNING CODCHAMADA INTO :ID
+            """,
+            {
+                "CODPARC": cod_parc,
+                "SENTIDO": sentido,
+                "MINUTOS": _TRAVA_MINUTOS,
+                "CODUSU": cod_usu,
+            },
+        )
+
+        for nufin in nufins:
+            cursor.execute(
+                """
+                INSERT INTO AD_COBRCHAMADAITEM (CODITEM, CODCHAMADA, NUFIN)
+                VALUES (SEQ_AD_COBRCHAMADAITEM.NEXTVAL, :CODCHAMADA, :NUFIN)
+                """,
+                {"CODCHAMADA": cod_chamada, "NUFIN": nufin},
+            )
+
+        # Lê as datas do banco (SYSDATE) em vez de usar a hora do container: o
+        # front compara a expiração com as travas que vêm do mesmo relógio.
+        cursor.execute(
+            "SELECT DHINICIO, DHEXPIRA FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID",
+            {"ID": cod_chamada},
+        )
+        dh_inicio, dh_expira = cursor.fetchone()
+
+        conexao.commit()
+        return (
+            jsonify(
+                {
+                    "sucesso": True,
+                    "codChamada": cod_chamada,
+                    "codParc": cod_parc,
+                    "sentido": sentido,
+                    "dhInicio": _dh(dh_inicio),
+                    "dhExpira": _dh(dh_expira),
+                    "nufins": nufins,
+                }
+            ),
+            201,
+        )
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/finalizar", methods=["PUT"])
+def chamada_finalizar(cod_chamada):
+    """Fecha a chamada, grava o desfecho por título e CALCULA A RÉGUA.
+
+    Body: { status, resumo?, dhAgenda?, itens: [{nufin, desfecho}] }
+    200:  { itens: [{nufin, ordem, desfecho}] }  (ordem = null em RECEPTIVA)
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        status = _obrig_dominio(data, "status", _STATUS_CHAMADA)
+        resumo = (data.get("resumo") or "").strip() or None
+        if resumo and len(resumo) > 4000:
+            raise _Invalido("'resumo' excede 4000 caracteres.")
+        dh_agenda = _parse_dh(data.get("dhAgenda"), "dhAgenda")
+        if status == "AGENDOU" and not dh_agenda:
+            raise _Invalido("Com status AGENDOU o campo 'dhAgenda' é obrigatório.")
+
+        desfechos = {}
+        for item in data.get("itens") or []:
+            if not isinstance(item, dict):
+                raise _Invalido("'itens' deve ser uma lista de {nufin, desfecho}.")
+            nufin = _obrig_int(item, "nufin")
+            desfecho = str(item.get("desfecho") or "").strip().upper() or None
+            if desfecho and desfecho not in _DESFECHOS:
+                raise _Invalido(
+                    f"'desfecho' deve ser um de: {', '.join(_DESFECHOS)}."
+                )
+            desfechos[nufin] = desfecho
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+
+        # FOR UPDATE no cabeçalho: dois "salvar" simultâneos não contam a régua
+        # em duplicidade (o segundo encontra a chamada já FINALIZADA).
+        cursor.execute(
+            "SELECT SENTIDO, SITUACAO FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID FOR UPDATE",
+            {"ID": cod_chamada},
+        )
+        row = cursor.fetchone()
+        if not row:
+            conexao.rollback()
+            return jsonify({"erro": f"Chamada {cod_chamada} não encontrada."}), 404
+
+        sentido, situacao = _txt(row[0]), _txt(row[1])
+        if situacao != "EM_ANDAMENTO":
+            conexao.rollback()
+            return (
+                jsonify({"erro": f"Chamada {cod_chamada} já está {situacao}."}),
+                409,
+            )
+        # Trava expirada NÃO impede finalizar: a expiração serve para liberar o
+        # título para outros, não para descartar o que o operador digitou.
+
+        cursor.execute(
+            "SELECT CODITEM, NUFIN FROM AD_COBRCHAMADAITEM WHERE CODCHAMADA = :ID ORDER BY CODITEM",
+            {"ID": cod_chamada},
+        )
+        itens = [(int(r[0]), int(r[1])) for r in cursor.fetchall()]
+        if not itens:
+            conexao.rollback()
+            return (
+                jsonify({"erro": f"Chamada {cod_chamada} não tem títulos vinculados."}),
+                409,
+            )
+
+        da_chamada = {nufin for _, nufin in itens}
+        desconhecidos = [n for n in desfechos if n not in da_chamada]
+        if desconhecidos:
+            conexao.rollback()
+            return (
+                jsonify(
+                    {
+                        "erro": f"Títulos {desconhecidos} não fazem parte da chamada "
+                        f"{cod_chamada}."
+                    }
+                ),
+                400,
+            )
+
+        resultado = []
+        for cod_item, nufin in itens:
+            ordem = None
+            if sentido == "PROATIVA":
+                # Régua do título: quantas proativas finalizadas ele já teve + 1.
+                # Gravada no item para a timeline não mudar retroativamente.
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM AD_COBRCHAMADAITEM i
+                    JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+                    WHERE i.NUFIN = :NUFIN
+                      AND c.SENTIDO = 'PROATIVA'
+                      AND c.SITUACAO = 'FINALIZADA'
+                      AND c.CODCHAMADA <> :ID
+                    """,
+                    {"NUFIN": nufin, "ID": cod_chamada},
+                )
+                ordem = int(cursor.fetchone()[0]) + 1
+
+            cursor.execute(
+                """
+                UPDATE AD_COBRCHAMADAITEM
+                   SET ORDEM = :ORDEM, DESFECHO = :DESFECHO
+                 WHERE CODITEM = :CODITEM
+                """,
+                {
+                    "ORDEM": ordem,
+                    "DESFECHO": desfechos.get(nufin),
+                    "CODITEM": cod_item,
+                },
+            )
+            resultado.append(
+                {"nufin": nufin, "ordem": ordem, "desfecho": desfechos.get(nufin)}
+            )
+
+        cursor.execute(
+            """
+            UPDATE AD_COBRCHAMADA
+               SET SITUACAO = 'FINALIZADA',
+                   DHFIM = SYSDATE,
+                   STATUS = :STATUS,
+                   RESUMO = :RESUMO,
+                   DHAGENDA = :DHAGENDA
+             WHERE CODCHAMADA = :ID
+            """,
+            {
+                "STATUS": status,
+                "RESUMO": resumo,
+                "DHAGENDA": dh_agenda,
+                "ID": cod_chamada,
+            },
+        )
+
+        conexao.commit()
+        return jsonify(
+            {
+                "sucesso": True,
+                "codChamada": cod_chamada,
+                "sentido": sentido,
+                "status": status,
+                "itens": resultado,
+            }
+        )
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/cancelar", methods=["POST"])
+def chamada_cancelar(cod_chamada):
+    """Descarta a chamada e LIBERA A TRAVA (operador fechou o modal sem registrar)."""
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(
+            "SELECT SITUACAO FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID FOR UPDATE",
+            {"ID": cod_chamada},
+        )
+        row = cursor.fetchone()
+        if not row:
+            conexao.rollback()
+            return jsonify({"erro": f"Chamada {cod_chamada} não encontrada."}), 404
+
+        situacao = _txt(row[0])
+        if situacao == "CANCELADA":
+            # Idempotente: o front cancela no fechar do modal e de novo no
+            # unload da aba; a segunda chamada não pode virar erro na tela.
+            conexao.rollback()
+            return jsonify({"sucesso": True, "codChamada": cod_chamada, "situacao": situacao})
+        if situacao != "EM_ANDAMENTO":
+            conexao.rollback()
+            return (
+                jsonify({"erro": f"Chamada {cod_chamada} já está {situacao}."}),
+                409,
+            )
+
+        # DHFIM também no cancelamento: registra quando a trava foi liberada.
+        cursor.execute(
+            """
+            UPDATE AD_COBRCHAMADA
+               SET SITUACAO = 'CANCELADA', DHFIM = SYSDATE
+             WHERE CODCHAMADA = :ID
+            """,
+            {"ID": cod_chamada},
+        )
+        conexao.commit()
+        return jsonify({"sucesso": True, "codChamada": cod_chamada, "situacao": "CANCELADA"})
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/renovar", methods=["PUT"])
+def chamada_renovar(cod_chamada):
+    """Heartbeat do modal aberto: empurra a expiração da trava por mais 15 min.
+
+    Se a trava já expirou e outro operador pegou algum título no intervalo,
+    devolve 409 — renovar não pode roubar a trava de quem chegou depois.
+    """
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(
+            "SELECT SITUACAO FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID FOR UPDATE",
+            {"ID": cod_chamada},
+        )
+        row = cursor.fetchone()
+        if not row:
+            conexao.rollback()
+            return jsonify({"erro": f"Chamada {cod_chamada} não encontrada."}), 404
+        if _txt(row[0]) != "EM_ANDAMENTO":
+            conexao.rollback()
+            return jsonify({"erro": f"Chamada {cod_chamada} já está {_txt(row[0])}."}), 409
+
+        cursor.execute(
+            "SELECT NUFIN FROM AD_COBRCHAMADAITEM WHERE CODCHAMADA = :ID",
+            {"ID": cod_chamada},
+        )
+        nufins = [int(r[0]) for r in cursor.fetchall()]
+        if nufins:
+            placeholders, binds = _binds_lista("N", nufins)
+            cursor.execute(
+                SQL_TRAVAS
+                + f" AND i.NUFIN IN ({placeholders}) AND c.CODCHAMADA <> :ID",
+                dict(binds, ID=cod_chamada),
+            )
+            travados = [_linha_trava(r) for r in cursor.fetchall()]
+            if travados:
+                conexao.rollback()
+                return (
+                    jsonify(
+                        {
+                            "erro": "A trava expirou e outro operador assumiu estes títulos.",
+                            "nufinsTravados": travados,
+                        }
+                    ),
+                    409,
+                )
+
+        cursor.execute(
+            """
+            UPDATE AD_COBRCHAMADA
+               SET DHEXPIRA = SYSDATE + :MINUTOS / 1440
+             WHERE CODCHAMADA = :ID
+            """,
+            {"MINUTOS": _TRAVA_MINUTOS, "ID": cod_chamada},
+        )
+        cursor.execute(
+            "SELECT DHEXPIRA FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID",
+            {"ID": cod_chamada},
+        )
+        dh_expira = cursor.fetchone()[0]
+        conexao.commit()
+        return jsonify(
+            {"sucesso": True, "codChamada": cod_chamada, "dhExpira": _dh(dh_expira)}
+        )
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas/<int:cod_chamada>/anexos", methods=["POST"])
+def chamada_anexo(cod_chamada):
+    """Anexa um LINK (drive da empresa) à chamada. Não guardamos arquivo.
+
+    Body: { url, descricao?, codUsu }
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        cod_usu = _obrig_int(data, "codUsu")
+        url = str(data.get("url") or "").strip()
+        if not url:
+            raise _Invalido("Parâmetro 'url' é obrigatório.")
+        # O app abre esse link direto; aceitar 'javascript:' seria abrir a porta
+        # para execução de script a partir de um campo de texto.
+        if not url.lower().startswith(("http://", "https://")):
+            raise _Invalido("'url' deve começar com http:// ou https://.")
+        if len(url) > 2000:
+            raise _Invalido("'url' excede 2000 caracteres.")
+        descricao = (str(data.get("descricao") or "").strip())[:100] or None
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(
+            "SELECT SITUACAO FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID",
+            {"ID": cod_chamada},
+        )
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"erro": f"Chamada {cod_chamada} não encontrada."}), 404
+        if _txt(row[0]) == "CANCELADA":
+            return (
+                jsonify({"erro": f"Chamada {cod_chamada} foi cancelada; não aceita anexo."}),
+                409,
+            )
+
+        # URL é CLOB no banco; com cx_Oracle basta bindar a string.
+        cod_anexo = _novo_id(
+            cursor,
+            """
+            INSERT INTO AD_COBRANEXO
+                (CODANEXO, CODCHAMADA, DESCRICAO, URL, DHANEXO, CODUSU)
+            VALUES
+                (SEQ_AD_COBRANEXO.NEXTVAL, :CODCHAMADA, :DESCRICAO, :URL,
+                 SYSDATE, :CODUSU)
+            RETURNING CODANEXO INTO :ID
+            """,
+            {
+                "CODCHAMADA": cod_chamada,
+                "DESCRICAO": descricao,
+                "URL": url,
+                "CODUSU": cod_usu,
+            },
+        )
+        conexao.commit()
+        return (
+            jsonify(
+                {
+                    "sucesso": True,
+                    "codAnexo": cod_anexo,
+                    "codChamada": cod_chamada,
+                    "descricao": descricao,
+                    "url": url,
+                }
+            ),
+            201,
+        )
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/chamadas", methods=["GET"])
+def chamadas():
+    """Histórico de chamadas do cliente (cabeçalho + títulos + anexos).
+
+    Query: ?codParc=<int>[&limite=<int>]
+    """
+    try:
+        cod_parc = _obrig_int(request.args, "codParc")
+        limite = int(request.args.get("limite") or 100)
+    except (_Invalido, ValueError) as err:
+        return jsonify({"erro": str(err)}), 400
+    limite = max(1, min(limite, 500))
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        # ROWNUM em vez de FETCH FIRST: não depende da versão do Oracle.
+        cursor.execute(
+            """
+            SELECT * FROM (
+                SELECT c.CODCHAMADA, c.CODPARC, c.SENTIDO, c.SITUACAO, c.DHINICIO,
+                       c.DHEXPIRA, c.DHFIM, c.STATUS, c.RESUMO, c.DHAGENDA,
+                       c.CODUSU, u.NOMEUSU
+                FROM AD_COBRCHAMADA c
+                LEFT JOIN TSIUSU u ON u.CODUSU = c.CODUSU
+                WHERE c.CODPARC = :CODPARC
+                ORDER BY c.DHINICIO DESC, c.CODCHAMADA DESC
+            ) WHERE ROWNUM <= :LIMITE
+            """,
+            {"CODPARC": cod_parc, "LIMITE": limite},
+        )
+        chamadas_por_id = {}
+        dados = []
+        for r in cursor.fetchall():
+            registro = {
+                "codChamada": int(r[0]),
+                "codParc": int(r[1]) if r[1] is not None else None,
+                "sentido": _txt(r[2]),
+                "situacao": _txt(r[3]),
+                "dhInicio": _dh(r[4]),
+                "dhExpira": _dh(r[5]),
+                "dhFim": _dh(r[6]),
+                "status": _txt(r[7]),
+                "resumo": _txt(r[8]),
+                "dhAgenda": _dh(r[9]),
+                "codUsu": int(r[10]) if r[10] is not None else None,
+                "nomeUsu": _txt(r[11]),
+                "itens": [],
+                "anexos": [],
+            }
+            chamadas_por_id[registro["codChamada"]] = registro
+            dados.append(registro)
+
+        if dados:
+            # Filhos por CODPARC (e não por IN de ids): uma consulta só, sem
+            # estourar o limite de expressões do IN quando o histórico é longo.
+            cursor.execute(
+                """
+                SELECT i.CODCHAMADA, i.CODITEM, i.NUFIN, i.ORDEM, i.DESFECHO
+                FROM AD_COBRCHAMADAITEM i
+                JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+                WHERE c.CODPARC = :CODPARC
+                ORDER BY i.CODITEM
+                """,
+                {"CODPARC": cod_parc},
+            )
+            for r in cursor.fetchall():
+                pai = chamadas_por_id.get(int(r[0]))
+                if pai is not None:
+                    pai["itens"].append(
+                        {
+                            "codItem": int(r[1]),
+                            "nufin": int(r[2]) if r[2] is not None else None,
+                            "ordem": int(r[3]) if r[3] is not None else None,
+                            "desfecho": _txt(r[4]),
+                        }
+                    )
+
+            cursor.execute(
+                """
+                SELECT a.CODCHAMADA, a.CODANEXO, a.DESCRICAO, a.URL, a.DHANEXO, a.CODUSU
+                FROM AD_COBRANEXO a
+                JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = a.CODCHAMADA
+                WHERE c.CODPARC = :CODPARC
+                ORDER BY a.CODANEXO
+                """,
+                {"CODPARC": cod_parc},
+            )
+            for r in cursor.fetchall():
+                pai = chamadas_por_id.get(int(r[0]))
+                if pai is not None:
+                    pai["anexos"].append(
+                        {
+                            "codAnexo": int(r[1]),
+                            "descricao": _txt(r[2]),
+                            "url": _texto_lob(r[3]),
+                            "dhAnexo": _dh(r[4]),
+                            "codUsu": int(r[5]) if r[5] is not None else None,
+                        }
+                    )
+
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/locks", methods=["GET"])
+def locks():
+    """Títulos em chamada NESTE MOMENTO — alimenta o badge "em chamada por...".
+
+    Query: ?nufins=1,2,3 (opcional). Sem filtro, devolve todas as travas ativas
+    — são poucas por natureza (uma por título aberto num modal), então filtrar
+    em Python evita montar um IN com as centenas de títulos da tela.
+    """
+    filtro = request.args.get("nufins")
+    alvo = None
+    if filtro:
+        try:
+            alvo = {int(p) for p in filtro.split(",") if p.strip()}
+        except ValueError:
+            return jsonify({"erro": "'nufins' deve ser uma lista de inteiros separados por vírgula."}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(SQL_TRAVAS + " ORDER BY i.NUFIN")
+        dados = [_linha_trava(r) for r in cursor.fetchall()]
+        if alvo is not None:
+            dados = [d for d in dados if d["nufin"] in alvo]
+
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/regua", methods=["GET"])
+def regua():
+    """Posição na régua de cada título do cliente (badge 1ª/2ª/3ª chamada).
+
+    Query: ?codParc=<int>
+    Conta só chamadas PROATIVA + FINALIZADA — receptiva não empurra pro jurídico.
+    `podeJuridico` = ordemAtual >= 3 (o envio em si continua manual).
+    """
+    try:
+        cod_parc = _obrig_int(request.args, "codParc")
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(
+            """
+            SELECT NUFIN, ORDEMATUAL, DHULTIMA, DESFECHO, CODCHAMADA
+            FROM (
+                SELECT i.NUFIN,
+                       i.DESFECHO,
+                       c.CODCHAMADA,
+                       COUNT(*)     OVER (PARTITION BY i.NUFIN) AS ORDEMATUAL,
+                       MAX(c.DHFIM) OVER (PARTITION BY i.NUFIN) AS DHULTIMA,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY i.NUFIN
+                           ORDER BY NVL(i.ORDEM, 0) DESC, c.DHFIM DESC
+                       ) AS RN
+                FROM AD_COBRCHAMADAITEM i
+                JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+                WHERE c.CODPARC = :CODPARC
+                  AND c.SENTIDO = 'PROATIVA'
+                  AND c.SITUACAO = 'FINALIZADA'
+            ) WHERE RN = 1
+            ORDER BY NUFIN
+            """,
+            {"CODPARC": cod_parc},
+        )
+        dados = []
+        for r in cursor.fetchall():
+            ordem = int(r[1] or 0)
+            dados.append(
+                {
+                    "nufin": int(r[0]),
+                    "ordemAtual": ordem,
+                    "dhUltima": _dh(r[2]),
+                    "ultimoDesfecho": _txt(r[3]),
+                    "codChamada": int(r[4]),
+                    "podeJuridico": ordem >= 3,
+                }
+            )
+
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
 
     except cx_Oracle.Error as err:
