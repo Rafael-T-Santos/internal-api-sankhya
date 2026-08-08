@@ -1935,32 +1935,44 @@ def regua():
 
 # --- Painel da gerência -------------------------------------------------------
 #
-# Uma linha por CLIENTE, cruzando a carteira vencida com a régua de chamadas.
-# Responde o que a Visão 360° não responde: quem está sendo trabalhado, quem
-# parou no meio, quem tem retorno marcado e quem já esgotou a régua.
+# Uma linha por cliente **que já foi trabalhado** — ou seja, o painel é da
+# COBRANÇA, não da carteira. Quem nunca recebeu uma chamada não aparece aqui:
+# para olhar a dívida crua existe a tela de títulos.
 # Plano: dashboard-cobranca/docs/PAINEL-GERENTE.md
-
+#
+# A base é AD_COBRCHAMADA (quem foi trabalhado) e a carteira entra por LEFT
+# JOIN, não o contrário. Isso importa em dois pontos:
+#   - o painel não fica com um mar de "sem contato" (hoje seriam 342 de 344
+#     clientes, o que afogaria a informação útil);
+#   - cliente trabalhado que QUITOU continua aparecendo, com dívida zero, em vez
+#     de sumir da tela como se o trabalho não tivesse existido.
+#
 # A parte da carteira REAPROVEITA CTE_CHEQUES + SELECT_RECEITAS de propósito.
 # Reescrever aquela regra à mão (cheques pelo "bom para", RECDESP = 1, Regra 5
-# dos renegociados) faria o total do painel divergir da tela de Títulos
-# Vencidos — e dois números diferentes para a mesma coisa acabam com a
-# confiança nos dois.
+# dos renegociados) faria os valores do painel divergirem da tela de títulos —
+# e dois números diferentes para a mesma coisa acabam com a confiança nos dois.
 #
-# ATENÇÃO ao "ATRASO_DIAS > 0": o SELECT_RECEITAS tem o filtro de vencimento
-# COMENTADO (as linhas "FIN.DTVENC < TRUNC(SYSDATE)"), então ele devolve todo
-# título em aberto, vencido ou não. É por isso que /receitas-vencidas sem filtro
-# de período responde ~8.080 títulos em vez dos ~1.982 homologados. Aqui o
-# filtro é aplicado por fora, no envelope, para o painel falar de carteira
-# VENCIDA sem alterar o comportamento de um endpoint que já está em produção.
+# O "ATRASO_DIAS > 0" é necessário porque o SELECT_RECEITAS devolve todo título
+# em aberto, vencido ou não (o filtro de vencimento está comentado lá de
+# propósito: a tela de títulos usa os filtros de data para recortar). Aqui só
+# interessa o que já venceu.
 SQL_PAINEL_ENVELOPE = """
-, CARTEIRA AS (
-    SELECT CODPARC, NOMEPARC, CNPJ_CPF, NUFIN, ATRASO_DIAS,
+, TRABALHADOS AS (
+    SELECT CODPARC,
+           SUM(CASE WHEN SITUACAO = 'FINALIZADA' THEN 1 ELSE 0 END) AS QTD_CHAMADAS
+    FROM AD_COBRCHAMADA
+    WHERE SITUACAO IN ('FINALIZADA', 'EM_ANDAMENTO')
+    GROUP BY CODPARC
+),
+CARTEIRA AS (
+    SELECT CODPARC, NUFIN, ATRASO_DIAS,
            CASE WHEN CODTIPTIT = 3
                 THEN NVL(VLR_CHEQUE, NVL(VLRDESDOB, VLRLIQUIDO))
                 ELSE NVL(VLRDESDOB, NVL(VLR_CHEQUE, VLRLIQUIDO))
            END AS VALOR
     FROM ( {carteira} )
     WHERE ATRASO_DIAS > 0
+      AND CODPARC IN (SELECT CODPARC FROM TRABALHADOS)
 ),
 /* Posição de cada título na régua. Mesma regra do /regua: só PROATIVA +
    FINALIZADA conta, porque chamada receptiva não empurra para o jurídico. */
@@ -1980,32 +1992,32 @@ REGUA AS (
     ) WHERE RN = 1
 ),
 POR_CLIENTE AS (
-    SELECT ca.CODPARC,
-           MAX(ca.NOMEPARC)     AS NOMEPARC,
-           MAX(ca.CNPJ_CPF)     AS CNPJ_CPF,
-           COUNT(*)             AS QTD_TITULOS,
-           SUM(ca.VALOR)        AS VALOR_TOTAL,
-           MAX(ca.ATRASO_DIAS)  AS MAIOR_ATRASO,
-           NVL(MAX(r.ORDEM), 0) AS ESTAGIO,
-           SUM(CASE WHEN r.NUFIN IS NULL THEN 1 ELSE 0 END) AS SEM_CONTATO,
-           SUM(CASE WHEN r.ORDEM  = 1 THEN 1 ELSE 0 END)    AS ORD1,
-           SUM(CASE WHEN r.ORDEM  = 2 THEN 1 ELSE 0 END)    AS ORD2,
-           SUM(CASE WHEN r.ORDEM >= 3 THEN 1 ELSE 0 END)    AS ORD3,
-           /* Desfecho do título MAIS AVANÇADO na régua — é ele que decide se o
+    SELECT t.CODPARC,
+           t.QTD_CHAMADAS,
+           COUNT(ca.NUFIN)          AS QTD_TITULOS,
+           NVL(SUM(ca.VALOR), 0)    AS VALOR_TOTAL,
+           NVL(MAX(ca.ATRASO_DIAS), 0) AS MAIOR_ATRASO,
+           NVL(MAX(r.ORDEM), 0)     AS ESTAGIO,
+           SUM(CASE WHEN ca.NUFIN IS NOT NULL AND r.NUFIN IS NULL THEN 1 ELSE 0 END) AS SEM_CONTATO,
+           SUM(CASE WHEN r.ORDEM  = 1 THEN 1 ELSE 0 END) AS ORD1,
+           SUM(CASE WHEN r.ORDEM  = 2 THEN 1 ELSE 0 END) AS ORD2,
+           SUM(CASE WHEN r.ORDEM >= 3 THEN 1 ELSE 0 END) AS ORD3,
+           /* Desfecho do título MAIS AVANÇADO na régua — é ele que diz se o
               cliente ainda está em negociação ou já fechou acordo. */
            MAX(r.DESFECHO) KEEP (
                DENSE_RANK LAST ORDER BY NVL(r.ORDEM, 0), r.DHULTIMA
            ) AS ULT_DESFECHO
-    FROM CARTEIRA ca
-    LEFT JOIN REGUA r ON r.NUFIN = ca.NUFIN
-    GROUP BY ca.CODPARC
+    FROM TRABALHADOS t
+        LEFT JOIN CARTEIRA ca ON ca.CODPARC = t.CODPARC
+        LEFT JOIN REGUA    r  ON r.NUFIN    = ca.NUFIN
+    GROUP BY t.CODPARC, t.QTD_CHAMADAS
 ),
 ULT_CHAMADA AS (
     SELECT CODPARC, DHFIM, CODUSU FROM (
         SELECT CODPARC, DHFIM, CODUSU,
                ROW_NUMBER() OVER (PARTITION BY CODPARC ORDER BY DHFIM DESC) AS RN
         FROM AD_COBRCHAMADA
-        WHERE SITUACAO = 'FINALIZADA' AND SENTIDO = 'PROATIVA'
+        WHERE SITUACAO = 'FINALIZADA'
     ) WHERE RN = 1
 ),
 AGENDA AS (
@@ -2038,16 +2050,18 @@ TRAVA AS (
     SELECT DISTINCT CODPARC FROM AD_COBRCHAMADA
     WHERE SITUACAO = 'EM_ANDAMENTO' AND DHEXPIRA > SYSDATE
 )
-SELECT pc.CODPARC, pc.NOMEPARC, pc.CNPJ_CPF,
+SELECT pc.CODPARC, par.NOMEPARC, par.CGC_CPF,
        pc.QTD_TITULOS, pc.VALOR_TOTAL, pc.MAIOR_ATRASO,
        pc.ESTAGIO, pc.SEM_CONTATO, pc.ORD1, pc.ORD2, pc.ORD3, pc.ULT_DESFECHO,
-       uc.DHFIM      AS ULTIMO_CONTATO,
-       uu.NOMEUSU    AS ULTIMO_POR,
+       pc.QTD_CHAMADAS,
+       uc.DHFIM   AS ULTIMO_CONTATO,
+       uu.NOMEUSU AS ULTIMO_POR,
        ag.PROX_RETORNO,
-       au.NOMEUSU    AS PROX_POR,
+       au.NOMEUSU AS PROX_POR,
        atr.AGENDA_VENCIDA,
        CASE WHEN tv.CODPARC IS NULL THEN 0 ELSE 1 END AS EM_CHAMADA
 FROM POR_CLIENTE pc
+    INNER JOIN TGFPAR par ON par.CODPARC = pc.CODPARC
     LEFT JOIN ULT_CHAMADA uc  ON uc.CODPARC  = pc.CODPARC
     LEFT JOIN TSIUSU      uu  ON uu.CODUSU   = uc.CODUSU
     LEFT JOIN AGENDA      ag  ON ag.CODPARC  = pc.CODPARC
@@ -2058,15 +2072,19 @@ ORDER BY pc.VALOR_TOTAL DESC
 """
 
 
-def _situacao_cliente(estagio, agenda_vencida, prox_retorno, ult_desfecho):
+def _situacao_cliente(qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho):
     """Situação EXCLUSIVA do cliente, na ordem de precedência do plano (§3).
 
-    "Elegível ao jurídico" NÃO entra aqui: é sinalizador à parte. Um cliente
-    pode estar agendado E na 3ª chamada ao mesmo tempo, e transformar isso numa
+    Não existe "SEM_CONTATO" aqui: por construção, todo cliente do painel já foi
+    trabalhado. Cliente com estágio 0 é o que só teve chamada RECEPTIVA — houve
+    contato, mas a régua (que só conta proativa) não começou.
+
+    "Elegível ao jurídico" NÃO entra: é sinalizador à parte. Um cliente pode
+    estar agendado E na 3ª chamada ao mesmo tempo, e transformar isso numa
     situação exclusiva esconderia um dos dois.
     """
-    if estagio == 0:
-        return "SEM_CONTATO"
+    if qtd_titulos == 0:
+        return "SEM_DIVIDA"
     if agenda_vencida:
         return "RETORNO_ATRASADO"
     if prox_retorno:
@@ -2078,7 +2096,7 @@ def _situacao_cliente(estagio, agenda_vencida, prox_retorno, ult_desfecho):
 
 @bp.route("/api/cobranca/painel", methods=["GET"])
 def painel():
-    """Uma linha por cliente com dívida VENCIDA, com a posição dele na régua.
+    """Uma linha por cliente JÁ TRABALHADO, com a posição dele na régua.
 
     Query (opcionais): ?codVend=<int>&codCid=<int>
     """
@@ -2107,30 +2125,33 @@ def painel():
 
         dados = []
         for r in cursor.fetchall():
+            qtd_titulos = int(r[3] or 0)
             estagio = int(r[6] or 0)
             ult_desfecho = _txt(r[11])
-            agenda_vencida = _dh(r[16])
-            prox_retorno = _dh(r[14])
+            prox_retorno = _dh(r[15])
+            agenda_vencida = _dh(r[17])
             dados.append(
                 {
                     "codParc": int(r[0]),
                     "nomeParc": _txt(r[1]),
+                    # Cru, como no /cobranca/cliente — quem formata é o fmtDoc do app.
                     "cgcCpf": _txt(r[2]),
-                    "qtdTitulos": int(r[3] or 0),
+                    "qtdTitulos": qtd_titulos,
                     "valorTotal": float(r[4] or 0),
                     "maiorAtrasoDias": int(r[5] or 0),
                     "estagio": estagio,
                     "titulosSemContato": int(r[7] or 0),
                     "porOrdem": {"1": int(r[8] or 0), "2": int(r[9] or 0), "3": int(r[10] or 0)},
                     "ultimoDesfecho": ult_desfecho,
-                    "ultimoContatoEm": _dh(r[12]),
-                    "ultimoContatoPor": _txt(r[13]),
+                    "qtdChamadas": int(r[12] or 0),
+                    "ultimoContatoEm": _dh(r[13]),
+                    "ultimoContatoPor": _txt(r[14]),
                     "proximoRetornoEm": prox_retorno,
-                    "proximoRetornoPor": _txt(r[15]),
+                    "proximoRetornoPor": _txt(r[16]),
                     "retornoAtrasadoDe": agenda_vencida,
-                    "emChamadaAgora": bool(r[17]),
+                    "emChamadaAgora": bool(r[18]),
                     "situacao": _situacao_cliente(
-                        estagio, agenda_vencida, prox_retorno, ult_desfecho
+                        qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho
                     ),
                     # Elegibilidade, NÃO encaminhamento: não existe Fase 4 no
                     # sistema. Ver docs/PAINEL-GERENTE.md §2.

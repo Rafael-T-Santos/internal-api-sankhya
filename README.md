@@ -746,14 +746,16 @@ Posição de cada título na régua (badge 1ª/2ª/3ª chamada).
 
 #### `GET /api/cobranca/painel[?codVend=10&codCid=5]`
 
-Uma linha por **cliente** com dívida vencida, cruzando a carteira com a régua de chamadas. É a consulta que responde "o que está acontecendo na cobrança": quem já foi contatado, quem parou no meio, quem tem retorno marcado e quem esgotou a régua.
+Uma linha por **cliente que já foi trabalhado** — o painel é da **cobrança**, não da carteira. Quem nunca recebeu uma chamada **não aparece**: para olhar a dívida crua existe `/api/receitas-vencidas`. Responde "o que está acontecendo na cobrança": quem já foi contatado, quem parou no meio, quem tem retorno marcado e quem esgotou a régua.
+
+A base é `AD_COBRCHAMADA` (quem foi trabalhado) e a carteira entra por `LEFT JOIN`. Consequência desejada: cliente trabalhado que **quitou** continua aparecendo, com dívida zero e `situacao: "SEM_DIVIDA"`, em vez de sumir da tela como se o trabalho não tivesse existido.
 
 ```jsonc
 { "sucesso": true, "totalRegistros": 412, "dados": [
   { "codParc": 11107, "nomeParc": "FARMACIA N.S. DAS CANDEIAS", "cgcCpf": "12.345.678/0001-90",
     "qtdTitulos": 5, "valorTotal": 8420.55, "maiorAtrasoDias": 96,
     "estagio": 3, "titulosSemContato": 2, "porOrdem": { "1": 2, "2": 0, "3": 1 },
-    "ultimoDesfecho": "SEM_ACORDO",
+    "ultimoDesfecho": "SEM_ACORDO", "qtdChamadas": 4,
     "ultimoContatoEm": "2026-08-01 09:20:00", "ultimoContatoPor": "RAFAEL",
     "proximoRetornoEm": null, "proximoRetornoPor": null,
     "retornoAtrasadoDe": "2026-08-05 14:00:00",
@@ -763,11 +765,13 @@ Uma linha por **cliente** com dívida vencida, cruzando a carteira com a régua 
 
 `estagio` é a **maior** ordem entre os títulos do cliente; `porOrdem` traz a quebra, porque um cliente pode ter títulos em estágios diferentes e o número único sozinho mentiria.
 
-`situacao` é exclusiva e sai nesta precedência: `SEM_CONTATO` → `RETORNO_ATRASADO` → `AGENDADO` → `ACORDO` → `EM_ANDAMENTO`. `RETORNO_ATRASADO` = havia retorno marcado no passado e **nenhuma** chamada finalizada depois dele.
+`situacao` é exclusiva e sai nesta precedência: `SEM_DIVIDA` → `RETORNO_ATRASADO` → `AGENDADO` → `ACORDO` → `EM_ANDAMENTO`. `RETORNO_ATRASADO` = havia retorno marcado no passado e **nenhuma** chamada finalizada depois dele — é o estado mais acionável do painel.
+
+Não existe `SEM_CONTATO`: por construção todo cliente aqui já foi trabalhado. `estagio: 0` é o cliente que só teve chamada **receptiva** — houve contato, mas a régua (que só conta proativa) não começou.
 
 `podeJuridico` é **sinalizador separado**, não situação: um cliente pode estar agendado *e* na 3ª chamada, e transformar isso em situação exclusiva esconderia um dos dois. Significa apenas **elegibilidade** (`estagio >= 3` sem acordo) — não existe encaminhamento ao jurídico no sistema.
 
-Só entram títulos **vencidos** (`ATRASO_DIAS > 0`). Repare que isso difere do `/receitas-vencidas`, cujo filtro de vencimento está comentado no SQL e por isso devolve todo título em aberto quando não recebe período — ver *Limitações conhecidas*.
+Nos valores só entram títulos **vencidos** (`ATRASO_DIAS > 0`). O `/receitas-vencidas` devolve também os que ainda vão vencer — de propósito, porque aquela tela usa os filtros de data para recortar o período.
 
 ---
 
@@ -842,7 +846,7 @@ Nada disso é bug novo — é o estado atual, documentado para quem for mexer:
 - **Uma conexão nova por request**, aberta e fechada a cada chamada — sem pool. Sob concorrência, isso vira gargalo no Oracle.
 - **Sem healthcheck** (`/health`) e sem logging estruturado — só `print()` para stdout.
 - **Sem paginação** em `/api/parceiros`, `/api/cidades`, `/api/vendedores` e `/api/receitas-vencidas` sem filtro.
-- 🔴 **`/api/receitas-vencidas` não filtra por vencimento.** As condições `FIN.DTVENC < TRUNC(SYSDATE)` estão **comentadas** dentro de `SELECT_RECEITAS`, então sem `dtInicial`/`dtFinal` o endpoint devolve todo título em aberto — vencido ou não (~8.080 títulos, contra os ~1.982 homologados com a gerente em julho). A tela de Títulos Vencidos só não expõe isso porque exige as duas datas. Pior: o campo `situacao` rotula esses títulos como `TÍTULO VENCIDO SEM PAGAMENTO` mesmo quando ainda não venceram. O `/api/cobranca/painel` contorna aplicando `ATRASO_DIAS > 0` por fora; a decisão de descomentar (e o impacto na tela existente) continua em aberto.
+- **O nome `/api/receitas-vencidas` mente, e o campo `situacao` também.** As condições `FIN.DTVENC < TRUNC(SYSDATE)` estão comentadas em `SELECT_RECEITAS` **de propósito**: a tela que consome este endpoint mostra títulos a vencer também, e usa os filtros de data para recortar o período. O endpoint devolve, portanto, todo título em aberto (hoje: 8.068 no total, sendo 1.246 vencidos e 6.822 a vencer). O problema real não é o filtro, é a nomenclatura — e principalmente o campo `situacao`, que rotula como `TÍTULO VENCIDO SEM PAGAMENTO` títulos que **ainda não venceram**. Isso é dado incorreto, não só nome ruim. Renomeação de endpoint/tela/rótulo está planejada.
 - **Quase sem testes.** Só a régua de chamadas tem cobertura ([tests/smoke-chamadas.ps1](#testes)); os outros 4 domínios não têm nenhuma.
 
 As queries usam bind variables em todos os endpoints, inclusive no SQL dinâmico de `/api/verificar-produto` — não há injeção de SQL.
