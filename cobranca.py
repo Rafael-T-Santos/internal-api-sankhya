@@ -1931,3 +1931,219 @@ def regua():
     finally:
         if conexao:
             conexao.close()
+
+
+# --- Painel da gerência -------------------------------------------------------
+#
+# Uma linha por CLIENTE, cruzando a carteira vencida com a régua de chamadas.
+# Responde o que a Visão 360° não responde: quem está sendo trabalhado, quem
+# parou no meio, quem tem retorno marcado e quem já esgotou a régua.
+# Plano: dashboard-cobranca/docs/PAINEL-GERENTE.md
+
+# A parte da carteira REAPROVEITA CTE_CHEQUES + SELECT_RECEITAS de propósito.
+# Reescrever aquela regra à mão (cheques pelo "bom para", RECDESP = 1, Regra 5
+# dos renegociados) faria o total do painel divergir da tela de Títulos
+# Vencidos — e dois números diferentes para a mesma coisa acabam com a
+# confiança nos dois.
+#
+# ATENÇÃO ao "ATRASO_DIAS > 0": o SELECT_RECEITAS tem o filtro de vencimento
+# COMENTADO (as linhas "FIN.DTVENC < TRUNC(SYSDATE)"), então ele devolve todo
+# título em aberto, vencido ou não. É por isso que /receitas-vencidas sem filtro
+# de período responde ~8.080 títulos em vez dos ~1.982 homologados. Aqui o
+# filtro é aplicado por fora, no envelope, para o painel falar de carteira
+# VENCIDA sem alterar o comportamento de um endpoint que já está em produção.
+SQL_PAINEL_ENVELOPE = """
+, CARTEIRA AS (
+    SELECT CODPARC, NOMEPARC, CNPJ_CPF, NUFIN, ATRASO_DIAS,
+           CASE WHEN CODTIPTIT = 3
+                THEN NVL(VLR_CHEQUE, NVL(VLRDESDOB, VLRLIQUIDO))
+                ELSE NVL(VLRDESDOB, NVL(VLR_CHEQUE, VLRLIQUIDO))
+           END AS VALOR
+    FROM ( {carteira} )
+    WHERE ATRASO_DIAS > 0
+),
+/* Posição de cada título na régua. Mesma regra do /regua: só PROATIVA +
+   FINALIZADA conta, porque chamada receptiva não empurra para o jurídico. */
+REGUA AS (
+    SELECT NUFIN, ORDEM, DHULTIMA, DESFECHO FROM (
+        SELECT i.NUFIN,
+               i.DESFECHO,
+               COUNT(*)     OVER (PARTITION BY i.NUFIN) AS ORDEM,
+               MAX(c.DHFIM) OVER (PARTITION BY i.NUFIN) AS DHULTIMA,
+               ROW_NUMBER() OVER (
+                   PARTITION BY i.NUFIN
+                   ORDER BY NVL(i.ORDEM, 0) DESC, c.DHFIM DESC
+               ) AS RN
+        FROM AD_COBRCHAMADAITEM i
+        JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+        WHERE c.SENTIDO = 'PROATIVA' AND c.SITUACAO = 'FINALIZADA'
+    ) WHERE RN = 1
+),
+POR_CLIENTE AS (
+    SELECT ca.CODPARC,
+           MAX(ca.NOMEPARC)     AS NOMEPARC,
+           MAX(ca.CNPJ_CPF)     AS CNPJ_CPF,
+           COUNT(*)             AS QTD_TITULOS,
+           SUM(ca.VALOR)        AS VALOR_TOTAL,
+           MAX(ca.ATRASO_DIAS)  AS MAIOR_ATRASO,
+           NVL(MAX(r.ORDEM), 0) AS ESTAGIO,
+           SUM(CASE WHEN r.NUFIN IS NULL THEN 1 ELSE 0 END) AS SEM_CONTATO,
+           SUM(CASE WHEN r.ORDEM  = 1 THEN 1 ELSE 0 END)    AS ORD1,
+           SUM(CASE WHEN r.ORDEM  = 2 THEN 1 ELSE 0 END)    AS ORD2,
+           SUM(CASE WHEN r.ORDEM >= 3 THEN 1 ELSE 0 END)    AS ORD3,
+           /* Desfecho do título MAIS AVANÇADO na régua — é ele que decide se o
+              cliente ainda está em negociação ou já fechou acordo. */
+           MAX(r.DESFECHO) KEEP (
+               DENSE_RANK LAST ORDER BY NVL(r.ORDEM, 0), r.DHULTIMA
+           ) AS ULT_DESFECHO
+    FROM CARTEIRA ca
+    LEFT JOIN REGUA r ON r.NUFIN = ca.NUFIN
+    GROUP BY ca.CODPARC
+),
+ULT_CHAMADA AS (
+    SELECT CODPARC, DHFIM, CODUSU FROM (
+        SELECT CODPARC, DHFIM, CODUSU,
+               ROW_NUMBER() OVER (PARTITION BY CODPARC ORDER BY DHFIM DESC) AS RN
+        FROM AD_COBRCHAMADA
+        WHERE SITUACAO = 'FINALIZADA' AND SENTIDO = 'PROATIVA'
+    ) WHERE RN = 1
+),
+AGENDA AS (
+    SELECT CODPARC, DHAGENDA AS PROX_RETORNO, CODUSU AS PROX_USU FROM (
+        SELECT CODPARC, DHAGENDA, CODUSU,
+               ROW_NUMBER() OVER (PARTITION BY CODPARC ORDER BY DHAGENDA) AS RN
+        FROM AD_COBRCHAMADA
+        WHERE SITUACAO = 'FINALIZADA'
+          AND DHAGENDA IS NOT NULL
+          AND DHAGENDA > SYSDATE
+    ) WHERE RN = 1
+),
+/* "Prometeu voltar e não voltou": existe retorno marcado no passado e NENHUMA
+   chamada finalizada depois dele. É o estado mais acionável do painel. */
+ATRASADO AS (
+    SELECT a.CODPARC, MAX(a.DHAGENDA) AS AGENDA_VENCIDA
+    FROM AD_COBRCHAMADA a
+    WHERE a.SITUACAO = 'FINALIZADA'
+      AND a.DHAGENDA IS NOT NULL
+      AND a.DHAGENDA <= SYSDATE
+      AND NOT EXISTS (
+          SELECT 1 FROM AD_COBRCHAMADA b
+          WHERE b.CODPARC  = a.CODPARC
+            AND b.SITUACAO = 'FINALIZADA'
+            AND b.DHFIM    > a.DHAGENDA
+      )
+    GROUP BY a.CODPARC
+),
+TRAVA AS (
+    SELECT DISTINCT CODPARC FROM AD_COBRCHAMADA
+    WHERE SITUACAO = 'EM_ANDAMENTO' AND DHEXPIRA > SYSDATE
+)
+SELECT pc.CODPARC, pc.NOMEPARC, pc.CNPJ_CPF,
+       pc.QTD_TITULOS, pc.VALOR_TOTAL, pc.MAIOR_ATRASO,
+       pc.ESTAGIO, pc.SEM_CONTATO, pc.ORD1, pc.ORD2, pc.ORD3, pc.ULT_DESFECHO,
+       uc.DHFIM      AS ULTIMO_CONTATO,
+       uu.NOMEUSU    AS ULTIMO_POR,
+       ag.PROX_RETORNO,
+       au.NOMEUSU    AS PROX_POR,
+       atr.AGENDA_VENCIDA,
+       CASE WHEN tv.CODPARC IS NULL THEN 0 ELSE 1 END AS EM_CHAMADA
+FROM POR_CLIENTE pc
+    LEFT JOIN ULT_CHAMADA uc  ON uc.CODPARC  = pc.CODPARC
+    LEFT JOIN TSIUSU      uu  ON uu.CODUSU   = uc.CODUSU
+    LEFT JOIN AGENDA      ag  ON ag.CODPARC  = pc.CODPARC
+    LEFT JOIN TSIUSU      au  ON au.CODUSU   = ag.PROX_USU
+    LEFT JOIN ATRASADO    atr ON atr.CODPARC = pc.CODPARC
+    LEFT JOIN TRAVA       tv  ON tv.CODPARC  = pc.CODPARC
+ORDER BY pc.VALOR_TOTAL DESC
+"""
+
+
+def _situacao_cliente(estagio, agenda_vencida, prox_retorno, ult_desfecho):
+    """Situação EXCLUSIVA do cliente, na ordem de precedência do plano (§3).
+
+    "Elegível ao jurídico" NÃO entra aqui: é sinalizador à parte. Um cliente
+    pode estar agendado E na 3ª chamada ao mesmo tempo, e transformar isso numa
+    situação exclusiva esconderia um dos dois.
+    """
+    if estagio == 0:
+        return "SEM_CONTATO"
+    if agenda_vencida:
+        return "RETORNO_ATRASADO"
+    if prox_retorno:
+        return "AGENDADO"
+    if ult_desfecho == "ACORDO":
+        return "ACORDO"
+    return "EM_ANDAMENTO"
+
+
+@bp.route("/api/cobranca/painel", methods=["GET"])
+def painel():
+    """Uma linha por cliente com dívida VENCIDA, com a posição dele na régua.
+
+    Query (opcionais): ?codVend=<int>&codCid=<int>
+    """
+    filtros = []
+    params = {}
+    for campo, coluna in (("codVend", "FIN.CODVEND"), ("codCid", "PAR.CODCID")):
+        valor = request.args.get(campo)
+        if valor not in (None, ""):
+            try:
+                params[campo.upper()] = int(valor)
+            except ValueError:
+                return jsonify({"erro": f"Parâmetro '{campo}' deve ser um número."}), 400
+            filtros.append(f"AND {coluna} = :{campo.upper()}")
+
+    carteira = SELECT_RECEITAS + "\n" + "\n".join(filtros)
+    sql = CTE_CHEQUES + SQL_PAINEL_ENVELOPE.format(carteira=carteira)
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql, params)
+
+        dados = []
+        for r in cursor.fetchall():
+            estagio = int(r[6] or 0)
+            ult_desfecho = _txt(r[11])
+            agenda_vencida = _dh(r[16])
+            prox_retorno = _dh(r[14])
+            dados.append(
+                {
+                    "codParc": int(r[0]),
+                    "nomeParc": _txt(r[1]),
+                    "cgcCpf": _txt(r[2]),
+                    "qtdTitulos": int(r[3] or 0),
+                    "valorTotal": float(r[4] or 0),
+                    "maiorAtrasoDias": int(r[5] or 0),
+                    "estagio": estagio,
+                    "titulosSemContato": int(r[7] or 0),
+                    "porOrdem": {"1": int(r[8] or 0), "2": int(r[9] or 0), "3": int(r[10] or 0)},
+                    "ultimoDesfecho": ult_desfecho,
+                    "ultimoContatoEm": _dh(r[12]),
+                    "ultimoContatoPor": _txt(r[13]),
+                    "proximoRetornoEm": prox_retorno,
+                    "proximoRetornoPor": _txt(r[15]),
+                    "retornoAtrasadoDe": agenda_vencida,
+                    "emChamadaAgora": bool(r[17]),
+                    "situacao": _situacao_cliente(
+                        estagio, agenda_vencida, prox_retorno, ult_desfecho
+                    ),
+                    # Elegibilidade, NÃO encaminhamento: não existe Fase 4 no
+                    # sistema. Ver docs/PAINEL-GERENTE.md §2.
+                    "podeJuridico": estagio >= 3 and ult_desfecho != "ACORDO",
+                }
+            )
+
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
