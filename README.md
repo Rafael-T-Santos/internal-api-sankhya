@@ -580,10 +580,19 @@ Identificação + KPIs do cliente para o topo da Visão 360°. Body: `{ "codParc
   "codParc": 100, "nomeParc": "CLIENTE X", "razaoSocial": "CLIENTE X LTDA",
   "cgcCpf": "12345678000199", "telefone": "81999998888", "email": null,
   "limiteCredito": 5000.0, "ativo": "S", "nomeCid": "RECIFE", "uf": "PE",
-  "vendedor": "CARLOS", "pontualidade": 87.5, "titulosQuitados12m": 40 } }
+  "vendedor": "CARLOS", "pontualidade": 99.0, "titulosPagos12m": 497,
+  "titulosAtraso12m": 452, "atrasoMedioDias": 1.8,
+  "pontualidadeAtualizadaEm": "2026-08-10",
+  "pontualidadeFonte": "SANKHYA_LIMCREDANALISE" } }
 ```
 
-`pontualidade` é `null` (e não `0`) quando não há título quitado nos últimos 12 meses — sem histórico não é o mesmo que mau pagador.
+`pontualidade` **não é calculada aqui**: vem de `AD_LIMCREDANALISE.PCT_PAGO_EM_DIA` (`VERSAO_MODELO = 'V1'`), materializada pela procedure `PRC_ATUALIZA_LIMCREDANALISE`. É a mesma que a análise de crédito do BI exibe. Recalcular por conta própria perde os atrasos regularizados por renegociação e trata entrada de cheque na conta `16` como pagamento definitivo.
+
+**Não é a proporção de títulos pagos no prazo.** O exemplo acima é real: 452 dos 497 títulos foram pagos com atraso — 9% por contagem — e o indicador é 99, porque o atraso médio é de 1,8 dia. Ele acompanha `ATRASO_MEDIO_DIAS`. Por isso `atrasoMedioDias` vai junto: o percentual sozinho é lido como "sempre paga em dia".
+
+`pontualidade` é `null` (e não `0`) só quando não há base nenhuma — nem título pago, nem em atraso. Zero **com** base é fato e vem como `0`: cliente sem nenhum pagamento e com atraso médio de 573 dias existe, e esconder o zero dele apagaria o pior pagador da carteira.
+
+`pontualidadeAtualizadaEm` é o `DH_PROCESSAMENTO` da linha. A procedure não reprocessa todo mundo todo dia — em 2026-08-10 as linhas iam de 27/05 a 10/08 — então a data importa.
 
 #### `POST /api/cobranca/extrato`
 

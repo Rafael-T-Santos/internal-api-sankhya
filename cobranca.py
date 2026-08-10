@@ -589,6 +589,48 @@ def receitas_vencidas():
 
 # --- Visão 360° do cliente ---
 
+# ---------------------------------------------------------------------------
+# Pontualidade: NÃO calcular aqui. Ler da AD_LIMCREDANALISE.
+#
+# O Sankhya já calcula a pontualidade histórica pela procedure
+# PRC_ATUALIZA_LIMCREDANALISE e deixa o resultado MATERIALIZADO na
+# AD_LIMCREDANALISE (PCT_PAGO_EM_DIA, já em escala 0-100). A consulta de
+# análise de crédito do BI apenas exibe esse valor — e o comentário dela diz o
+# porquê: recalcular "na mão" perde os atrasos que foram regularizados por
+# renegociação e trata entrada de cheque na conta 16 como pagamento definitivo.
+#
+# Eram exatamente os dois defeitos da versão anterior daqui, que fazia
+# COUNT(DHBAIXA <= DTVENC) sobre os títulos quitados em 12 meses:
+#   - cheque que entrou na conta 16 tem DHBAIXA preenchida e contava como pago
+#     em dia — sendo que é justamente o cheque pendente que a régua persegue;
+#   - título velho pago com atraso e depois renegociado saía da conta.
+# O número que mostrávamos era otimista, e diferente do que a gerência vê no BI
+# para o mesmo cliente. Dois números para a mesma coisa acabam com a confiança
+# nos dois.
+#
+# O QUE ESSE PERCENTUAL NÃO É (medido no banco em 2026-08-10):
+# ele NÃO é a proporção de títulos pagos no prazo. A LOPES E QUINTINO (11538)
+# pagou 452 dos 497 títulos COM ATRASO — 9% por contagem — e tem
+# PCT_PAGO_EM_DIA = 99, porque o atraso médio dela é de 1,75 dia. O número
+# acompanha o ATRASO_MEDIO_DIAS, não a contagem. É um indicador de análise de
+# crédito: tolera alguns dias de atraso e pergunta "esse cliente paga?".
+# Por isso ATRASO_MEDIO_DIAS vai junto para a tela: "99%" sozinho seria lido
+# como "sempre paga em dia", que não é o que o dado diz.
+#
+# CUIDADO COM O ZERO. A tabela cobre 15.469 clientes e NENHUM tem
+# PCT_PAGO_EM_DIA nulo: 14.390 estão zerados, e 14.336 desses não têm nenhum
+# título pago nem em atraso — são cadastros sem movimento, não maus pagadores.
+# Mas há zero que é VERDADE: a FARMACIA (11107) tem 0 pago, 2 em atraso e 573
+# dias de atraso médio. Esconder esse zero apagaria o pior pagador da lista.
+# Daí a régua ser "não há base NENHUMA" (pagos = 0 E atraso = 0), e não
+# "pagos = 0".
+#
+# DH_PROCESSAMENTO vai junto porque o valor é MATERIALIZADO por uma procedure
+# e NÃO é reprocessado todo dia para todo mundo: as linhas vão de 27/05 a 10/08
+# (11 datas distintas). Quem está com o cliente na linha precisa saber de quando
+# é o número.
+# ---------------------------------------------------------------------------
+
 SQL_CLIENTE = """
 SELECT
     PAR.CODPARC,
@@ -601,27 +643,20 @@ SELECT
     PAR.ATIVO,
     CID.NOMECID,
     UFS.UF,
-    NVL(VEN.APELIDO, 'SEM VENDEDOR') AS VENDEDOR
+    NVL(VEN.APELIDO, 'SEM VENDEDOR') AS VENDEDOR,
+    -- Pontualidade: ver o bloco de comentário acima do SQL_CLIENTE.
+    ANL.PCT_PAGO_EM_DIA,
+    ANL.QTD_TIT_PAGOS_12M,
+    ANL.QTD_TIT_ATRASO_12M,
+    ANL.DH_PROCESSAMENTO,
+    ANL.ATRASO_MEDIO_DIAS
 FROM TGFPAR PAR
     LEFT JOIN TSICID CID ON CID.CODCID  = PAR.CODCID
     LEFT JOIN TSIUFS UFS ON UFS.CODUF   = CID.UF
     LEFT JOIN TGFVEN VEN ON VEN.CODVEND = PAR.CODVEND
+    LEFT JOIN AD_LIMCREDANALISE ANL ON ANL.CODPARC       = PAR.CODPARC
+                                   AND ANL.VERSAO_MODELO = 'V1'
 WHERE PAR.CODPARC = :CODPARC
-"""
-
-# Pontualidade: dos títulos QUITADOS nos últimos 12 meses, quantos foram pagos
-# até o vencimento. É um número objetivo, tirado do próprio histórico — não é o
-# "score de risco" do protótipo, que ainda depende de política da gerência.
-SQL_PONTUALIDADE = """
-SELECT
-    COUNT(*) AS QUITADOS,
-    SUM(CASE WHEN TRUNC(FIN.DHBAIXA) <= TRUNC(FIN.DTVENC) THEN 1 ELSE 0 END) AS EM_DIA
-FROM TGFFIN FIN
-WHERE FIN.CODPARC = :CODPARC
-  AND FIN.RECDESP = 1
-  AND FIN.DHBAIXA IS NOT NULL
-  AND NVL(FIN.PROVISAO, 'N') = 'N'
-  AND FIN.DHBAIXA >= ADD_MONTHS(TRUNC(SYSDATE), -12)
 """
 
 # Extrato da 360°: títulos em aberto do cliente, VENCIDOS e A VENCER.
@@ -694,11 +729,6 @@ def cliente():
         if not row:
             return jsonify({"erro": f"Cliente {cod_parc} não encontrado."}), 404
 
-        cursor.execute(SQL_PONTUALIDADE, {"CODPARC": cod_parc})
-        quitados, em_dia = cursor.fetchone()
-        quitados = int(quitados or 0)
-        em_dia = int(em_dia or 0)
-
         return jsonify(
             {
                 "sucesso": True,
@@ -714,12 +744,22 @@ def cliente():
                     "nomeCid": _txt(row[8]),
                     "uf": _txt(row[9]),
                     "vendedor": _txt(row[10]),
-                    # null quando não há histórico: o front mostra "sem histórico",
-                    # em vez de fingir que 0% de pontualidade é um fato.
-                    "pontualidade": round(em_dia * 100.0 / quitados, 1)
-                    if quitados
+                    # Cálculo do próprio Sankhya (AD_LIMCREDANALISE). null só
+                    # quando não há base nenhuma — nem título pago, nem em atraso.
+                    # Ver o bloco de comentário do SQL_CLIENTE: há zero que é fato.
+                    "pontualidade": round(float(row[11]), 1)
+                    if row[11] is not None
+                    and (int(row[12] or 0) > 0 or int(row[13] or 0) > 0)
                     else None,
-                    "titulosQuitados12m": quitados,
+                    "titulosPagos12m": int(row[12]) if row[12] is not None else None,
+                    "titulosAtraso12m": int(row[13]) if row[13] is not None else None,
+                    "atrasoMedioDias": round(float(row[15]), 1)
+                    if row[15] is not None
+                    else None,
+                    "pontualidadeAtualizadaEm": row[14].strftime("%Y-%m-%d")
+                    if row[14]
+                    else None,
+                    "pontualidadeFonte": "SANKHYA_LIMCREDANALISE",
                 },
             }
         )
