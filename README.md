@@ -527,11 +527,15 @@ O relatório de inadimplência: títulos e cheques vencidos/pendentes.
 
 **O que entra no relatório** (`RECDESP = 1`, sem provisão, sem renegociação):
 
-- Títulos (`CODTIPTIT` 4, 5, 39) vencidos e sem baixa.
-- Cheques devolvidos (`CODTIPOPER = 1657`) sem baixa e não acertados.
-- Cheques vencidos não acertados, sem compensação, sem baixa **ou** baixados na conta `16` — e que não tenham um cheque devolvido em aberto correspondente.
+- Títulos (`CODTIPTIT` 2, 4, 5, 39) em aberto, sem baixa.
+- Títulos ativos gerados por renegociação, mesmo com tipo fora dessa lista (PIX, cartão).
+- Cheques (`CODTIPTIT = 3`), em três situações — a regra vive nas CTEs `CTE_CHEQUES`:
+  - **pendente** (`CHQ_NORMAL`): já baixado na conta `16`, mas ainda não resolvido;
+  - **em aberto** (`CHQ_ABERTO`): ainda sem baixa nenhuma no financeiro. Não filtra `AD_ACERTADO` (na prática esses cheques vêm com `'S'`) e aceita cheque sem registro na `TGFCHQ` — aí o número sai da nota e a data efetiva é o `DTVENC`;
+  - **devolvido** (`DEV_1657`): entrou pela TOP `1657` e continua sem baixa.
+  Cheque que já tem devolução correspondente não entra duas vezes: quem vale é a devolução.
 
-A coluna `situacao` traduz esses casos em texto: `CHEQUE DEVOLVIDO PENDENTE`, `CHEQUE VENCIDO PENDENTE - BAIXADO NA CONTA 16`, `CHEQUE VENCIDO SEM BAIXA` ou `TITULO VENCIDO SEM PAGAMENTO`.
+A coluna `situacao` traduz esses casos em texto: `CHEQUE PENDENTE`, `CHEQUE EM ABERTO`, `CHEQUE DEVOLVIDO`, `TÍTULO RENEGOCIADO VENCIDO SEM PAGAMENTO` ou `TÍTULO VENCIDO SEM PAGAMENTO`. Para cheque, a data que vale é o "bom para" (`TGFCHQ.DATACHEQUE`), e `atrasoDias` é calculado sobre ela.
 
 ```jsonc
 // Request

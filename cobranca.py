@@ -72,14 +72,32 @@ def _txt(valor):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Regra de cheques (pendentes e devolvidos)
+# Regra de cheques (pendentes, em aberto e devolvidos)
 #
-# Cheque não segue a regra dos demais títulos: um cheque pendente pode estar
-# BAIXADO (na conta 16) e um cheque devolvido entra pela TOP 1657. Por isso a
-# regra vive nestas CTEs, reaproveitadas pela consulta de títulos vencidos e
-# pelo extrato da Visão 360°.
+# Cheque não segue a regra dos demais títulos:
+#   - CHQ_NORMAL: já foi baixado na conta 16, mas continua pendente;
+#   - CHQ_ABERTO: ainda está em aberto no financeiro (sem baixa nenhuma);
+#   - DEV_1657: cheque devolvido pela TOP 1657 e ainda pendente.
 #
-# Fonte: relatório oficial de cheques pendentes/devolvidos do Sankhya.
+# A regra vive nestas CTEs, reaproveitadas pela consulta de títulos vencidos,
+# pelo extrato da Visão 360° e pelo painel da gerência.
+#
+# Fonte: relatório oficial de cheques do Sankhya (revisão do DBA de 2026-08-10,
+# que acrescentou o CHQ_ABERTO — a gerente reportou cheques faltando na tela).
+#
+# IMPORTANTE sobre CHQ_ABERTO:
+# - considera SOMENTE CODTIPTIT = 3; não inclui cartão/POS ou outro tipo;
+# - o JOIN com a TGFCHQ é LEFT de propósito: o financeiro pode ainda não ter o
+#   registro do cheque formado. Nesse caso o número sai do FIN.NUMNOTA e a data
+#   efetiva é o DTVENC;
+# - NÃO filtra AD_ACERTADO, porque foi validado no financeiro que um cheque
+#   ainda sem baixa pode estar com AD_ACERTADO = 'S' (é o filtro que fazia esses
+#   cheques sumirem da consulta);
+# - mantém RECDESP = 1 e exclui a origem neutralizada de renegociação;
+# - repete a exclusão por devolução TOP 1657 do CHQ_NORMAL: sem ela o mesmo
+#   cheque apareceria duas vezes, como "EM ABERTO" (título original) e como
+#   "DEVOLVIDO" (título da devolução), dobrando o valor na carteira.
+#
 # Para cheque, o vencimento que vale é o "bom para" (TGFCHQ.DATACHEQUE) — e não
 # o DTVENC do financeiro. O cálculo de atraso segue essa data.
 # ---------------------------------------------------------------------------
@@ -163,6 +181,73 @@ CHQ_NORMAL AS (
             )
       )
 ),
+CHQ_ABERTO AS (
+    SELECT
+        'A' AS STATUS_REGRA,
+        'CHQ_ABERTO' AS ORIGEM_REGRA,
+        FIN.NUFIN,
+        /* Sem TGFCHQ formada, o número do cheque é o da nota. */
+        TO_CHAR(NVL(CHQ.NUMCHEQUE, FIN.NUMNOTA)) AS CHEQUE,
+        ROUND(NVL(NULLIF(CHQ.VLRCHEQUE, 0), NVL(FIN.VLRDESDOB, 0)), 2) AS VLRCHEQUE_REGRA,
+        NVL(CHQ.DATACHEQUE, FIN.DTVENC) AS DATACHEQUE_REGRA,
+        'Em aberto' AS ULTIMO_EVENTO_REGRA
+    FROM TGFFIN FIN
+    /* LEFT de propósito: o financeiro pode não ter o cheque cadastrado ainda. */
+    LEFT JOIN TGFCHQ CHQ ON CHQ.NUFIN = FIN.NUFIN
+    WHERE FIN.CODTIPTIT = 3
+      AND FIN.RECDESP = 1
+      AND NVL(FIN.PROVISAO, 'N') = 'N'
+      /* Devolução é tratada pela DEV_1657. */
+      AND NVL(FIN.CODTIPOPER, 0) <> 1657
+      /* Principal diferença para o CHQ_NORMAL: ainda não houve baixa nenhuma. */
+      AND FIN.DHBAIXA IS NULL
+      AND NVL(FIN.VLRBAIXA, 0) = 0
+      AND NVL(FIN.NUCOMPENS, 0) = 0
+      /* AD_ACERTADO NÃO é filtro aqui: nos casos validados estava 'S'. */
+      /* Exclui só o título de ORIGEM da renegociação; o de destino continua entrando. */
+      AND NOT EXISTS (
+          SELECT 1 FROM TGFREN REN_ORIG WHERE REN_ORIG.NUFIN = FIN.NUFIN
+      )
+      /* Se já houver TGFCHQ, respeita o status; sem TGFCHQ, continua entrando. */
+      AND NVL(CHQ.STATUS, 'X') <> 'T'
+      AND NVL(CHQ.DATACHEQUE, FIN.DTVENC) IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM TGFFRE FRE
+          WHERE FRE.NUFIN = FIN.NUFIN AND FRE.TIPACERTO = 'C'
+      )
+      /* Pagamento/transferência definitivo (sem devolução posterior) não entra. */
+      AND NOT EXISTS (
+          SELECT 1 FROM TGFECQ EVTPAG
+          WHERE EVTPAG.NUCHQ = CHQ.NUCHQ
+            AND EVTPAG.TIPO IN ('P', 'T')
+            AND NOT EXISTS (
+                SELECT 1 FROM TGFECQ EVTDEV
+                WHERE EVTDEV.NUCHQ = EVTPAG.NUCHQ
+                  AND EVTDEV.TIPO = 'D'
+                  AND NVL(EVTDEV.NUEVENTO, 0) > NVL(EVTPAG.NUEVENTO, 0)
+            )
+      )
+      /* Já existe a devolução do mesmo cheque pela TOP 1657: quem vale é ela
+         (DEV_1657). Sem esta exclusão o cheque seria contado duas vezes. */
+      AND NOT EXISTS (
+          SELECT 1 FROM TGFFIN DEV
+          WHERE DEV.CODPARC = FIN.CODPARC
+            AND DEV.RECDESP = 1
+            AND DEV.CODTIPOPER = 1657
+            AND NVL(DEV.PROVISAO, 'N') = 'N'
+            AND (
+                  REGEXP_LIKE(
+                      UPPER(NVL(DEV.HISTORICO, ' ')),
+                      '(^|[^0-9])0*' ||
+                      NVL(NULLIF(LTRIM(TO_CHAR(NVL(CHQ.NUMCHEQUE, FIN.NUMNOTA)), '0'), ''), '0') ||
+                      '([^0-9]|$)'
+                  )
+                  OR
+                  NVL(NULLIF(LTRIM(TO_CHAR(DEV.NUMNOTA), '0'), ''), '0') =
+                  NVL(NULLIF(LTRIM(TO_CHAR(NVL(CHQ.NUMCHEQUE, FIN.NUMNOTA)), '0'), ''), '0')
+            )
+      )
+),
 DEV_1657 AS (
     SELECT
         'D' AS STATUS_REGRA,
@@ -208,6 +293,10 @@ CHEQUES_REGRA AS (
     SELECT STATUS_REGRA, ORIGEM_REGRA, NUFIN, CHEQUE,
            VLRCHEQUE_REGRA, DATACHEQUE_REGRA, ULTIMO_EVENTO_REGRA
     FROM CHQ_NORMAL
+    UNION ALL
+    SELECT STATUS_REGRA, ORIGEM_REGRA, NUFIN, CHEQUE,
+           VLRCHEQUE_REGRA, DATACHEQUE_REGRA, ULTIMO_EVENTO_REGRA
+    FROM CHQ_ABERTO
     UNION ALL
     SELECT STATUS_REGRA, ORIGEM_REGRA, NUFIN, CHEQUE,
            VLRCHEQUE_REGRA, DATACHEQUE_REGRA, ULTIMO_EVENTO_REGRA
@@ -311,7 +400,7 @@ def parceiros():
             conexao.close()
 
 
-# --- Títulos vencidos / cheques pendentes ---
+# --- Títulos vencidos / cheques pendentes, em aberto e devolvidos ---
 
 SELECT_RECEITAS = f"""
 SELECT
@@ -340,6 +429,7 @@ SELECT
     TIT.DESCRTIPTIT,
     CASE
         WHEN FIN.CODTIPTIT = 3 AND CHR.STATUS_REGRA = 'P' THEN 'CHEQUE PENDENTE'
+        WHEN FIN.CODTIPTIT = 3 AND CHR.STATUS_REGRA = 'A' THEN 'CHEQUE EM ABERTO'
         WHEN FIN.CODTIPTIT = 3 AND CHR.STATUS_REGRA = 'D' THEN 'CHEQUE DEVOLVIDO'
         WHEN FIN.CODTIPTIT <> 3 AND FIN.NURENEG IS NOT NULL
             THEN 'TÍTULO RENEGOCIADO VENCIDO SEM PAGAMENTO'
@@ -536,7 +626,7 @@ WHERE FIN.CODPARC = :CODPARC
 
 # Extrato da 360°: títulos em aberto do cliente, VENCIDOS e A VENCER.
 # Não-cheques: sem baixa (independente do vencimento). Cheques: mesma regra da
-# consulta de títulos (CHEQUES_REGRA) — ou seja, pendentes e devolvidos.
+# consulta de títulos (CHEQUES_REGRA) — pendentes, em aberto e devolvidos.
 SELECT_EXTRATO = f"""
 SELECT
     FIN.NUFIN,
