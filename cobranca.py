@@ -2364,6 +2364,17 @@ REGUA AS (
         WHERE c.SENTIDO = 'PROATIVA' AND c.SITUACAO = 'FINALIZADA'
     ) WHERE RN = 1
 ),
+/* Marcador "cliente informou pagamento", por título. Sem filtro de SENTIDO de
+   propósito: vale tanto o registro rápido (receptiva) quanto o desfecho marcado
+   durante uma ligação normal. */
+PAGTO_INF AS (
+    SELECT i.NUFIN, MAX(c.DHFIM) AS DHINFORMADO
+    FROM AD_COBRCHAMADAITEM i
+    JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+    WHERE i.DESFECHO = 'PAGAMENTO_INFORMADO'
+      AND c.SITUACAO = 'FINALIZADA'
+    GROUP BY i.NUFIN
+),
 POR_CLIENTE AS (
     SELECT t.CODPARC,
            t.QTD_CHAMADAS,
@@ -2379,10 +2390,16 @@ POR_CLIENTE AS (
               cliente ainda está em negociação ou já fechou acordo. */
            MAX(r.DESFECHO) KEEP (
                DENSE_RANK LAST ORDER BY NVL(r.ORDEM, 0), r.DHULTIMA
-           ) AS ULT_DESFECHO
+           ) AS ULT_DESFECHO,
+           /* Só conta marcador de título QUE AINDA ESTÁ NA CARTEIRA (o join é
+              com ca.NUFIN). Quando a baixa sai, o título deixa a CARTEIRA e o
+              sinal se apaga sozinho — ninguém precisa limpar marcador nenhum. */
+           COUNT(pi.NUFIN)     AS QTD_PAGTO_INF,
+           MAX(pi.DHINFORMADO) AS DH_PAGTO_INF
     FROM TRABALHADOS t
-        LEFT JOIN CARTEIRA ca ON ca.CODPARC = t.CODPARC
-        LEFT JOIN REGUA    r  ON r.NUFIN    = ca.NUFIN
+        LEFT JOIN CARTEIRA  ca ON ca.CODPARC = t.CODPARC
+        LEFT JOIN REGUA     r  ON r.NUFIN    = ca.NUFIN
+        LEFT JOIN PAGTO_INF pi ON pi.NUFIN   = ca.NUFIN
     GROUP BY t.CODPARC, t.QTD_CHAMADAS
 ),
 ULT_CHAMADA AS (
@@ -2432,7 +2449,10 @@ SELECT pc.CODPARC, par.NOMEPARC, par.CGC_CPF,
        ag.PROX_RETORNO,
        au.NOMEUSU AS PROX_POR,
        atr.AGENDA_VENCIDA,
-       CASE WHEN tv.CODPARC IS NULL THEN 0 ELSE 1 END AS EM_CHAMADA
+       CASE WHEN tv.CODPARC IS NULL THEN 0 ELSE 1 END AS EM_CHAMADA,
+       /* No FIM da lista de propósito: a leitura em Python é posicional, então
+          coluna nova no meio deslocaria todos os índices seguintes. */
+       pc.QTD_PAGTO_INF, pc.DH_PAGTO_INF
 FROM POR_CLIENTE pc
     INNER JOIN TGFPAR par ON par.CODPARC = pc.CODPARC
     LEFT JOIN ULT_CHAMADA uc  ON uc.CODPARC  = pc.CODPARC
@@ -2523,6 +2543,12 @@ def painel():
                     "proximoRetornoPor": _txt(r[16]),
                     "retornoAtrasadoDe": agenda_vencida,
                     "emChamadaAgora": bool(r[18]),
+                    # SINALIZADOR, não situação: o cliente pode ter informado
+                    # pagamento E estar com retorno atrasado ao mesmo tempo, e
+                    # virar situação exclusiva esconderia um dos dois — mesmo
+                    # motivo do podeJuridico (docs/PAINEL-GERENTE.md §3).
+                    "titulosPagamentoInformado": int(r[19] or 0),
+                    "pagamentoInformadoEm": _dh(r[20]),
                     "situacao": _situacao_cliente(
                         qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho
                     ),

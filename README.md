@@ -821,6 +821,7 @@ A base é `AD_COBRCHAMADA` (quem foi trabalhado) e a carteira entra por `LEFT JO
     "proximoRetornoEm": null, "proximoRetornoPor": null,
     "retornoAtrasadoDe": "2026-08-05 14:00:00",
     "emChamadaAgora": false,
+    "titulosPagamentoInformado": 2, "pagamentoInformadoEm": "2026-08-15 10:22:31",
     "situacao": "RETORNO_ATRASADO", "podeJuridico": true } ] }
 ```
 
@@ -831,6 +832,8 @@ A base é `AD_COBRCHAMADA` (quem foi trabalhado) e a carteira entra por `LEFT JO
 Não existe `SEM_CONTATO`: por construção todo cliente aqui já foi trabalhado. `estagio: 0` é o cliente que só teve chamada **receptiva** — houve contato, mas a régua (que só conta proativa) não começou.
 
 `podeJuridico` é **sinalizador separado**, não situação: um cliente pode estar agendado *e* na 3ª chamada, e transformar isso em situação exclusiva esconderia um dos dois. Significa apenas **elegibilidade** (`estagio >= 3` sem acordo) — não existe encaminhamento ao jurídico no sistema.
+
+`titulosPagamentoInformado` é sinalizador pelo mesmo motivo (o cliente pode ter avisado que pagou *e* estar com retorno atrasado). Conta só títulos **que ainda estão na carteira**: quando a baixa sai, o título deixa a carteira e o sinal se apaga sozinho, sem ninguém limpar marcador nenhum.
 
 Nos valores só entram títulos **vencidos** (`ATRASO_DIAS > 0`). O `/receitas-vencidas` devolve também os que ainda vão vencer — de propósito, porque aquela tela usa os filtros de data para recortar o período.
 
