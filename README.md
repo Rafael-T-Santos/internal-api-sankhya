@@ -637,7 +637,9 @@ Grava em três tabelas customizadas: `AD_COBRCHAMADA` (cabeçalho), `AD_COBRCHAM
 | Trava expira sozinha (15 min) | Toda consulta de trava filtra por `DHEXPIRA` — modal abandonado libera o título |
 | Jurídico na 3ª chamada é **opcional** | A API só marca `podeJuridico` quando `ordemAtual >= 3`; o envio é manual |
 
-Domínios aceitos: `sentido` = `PROATIVA`/`RECEPTIVA`; `status` = `ATENDEU`/`CAIXA_POSTAL`/`RECUSOU`/`AGENDOU`; `desfecho` = `ACORDO`/`SEM_ACORDO`/`EM_ABERTO`. Valor fora do domínio → `400`.
+Domínios aceitos: `sentido` = `PROATIVA`/`RECEPTIVA`; `status` = `ATENDEU`/`CAIXA_POSTAL`/`RECUSOU`/`AGENDOU`/`INFORMOU_PAGTO`; `desfecho` = `ACORDO`/`SEM_ACORDO`/`EM_ABERTO`/`PAGAMENTO_INFORMADO`. Valor fora do domínio → `400`.
+
+**`ACORDO` é renegociação formal**, não promessa de pagamento. Promessa vive no `dhAgenda` da chamada. A distinção importa porque `ACORDO` é o único freio do funil do jurídico (`podeJuridico` exclui quem tem `ultimoDesfecho = ACORDO`).
 
 > ### Todas as rotas de escrita exigem sessão
 >
@@ -754,6 +756,41 @@ Posição de cada título na régua (badge 1ª/2ª/3ª chamada).
 ```
 
 `codParc` é **opcional**: sem ele vem a carteira inteira, para a tela de títulos vencidos montar os badges de todos os clientes de uma vez. Isso não devolve a base toda — só entram títulos que **já tiveram** chamada proativa finalizada.
+
+#### `POST /api/cobranca/pagamento-informado`
+
+Registra que o cliente **informou** o pagamento de um ou mais títulos. Plano completo em `docs/PAGAMENTO-INFORMADO.md` do repositório do front.
+
+```jsonc
+// Request  (+ header Authorization: Bearer <token>)
+{ "codParc": 100, "nufins": [987654, 987655], "obs": "mandou comprovante no zap" }
+```
+
+```jsonc
+// 201
+{ "sucesso": true, "codChamada": 190, "codParc": 100,
+  "nufins": [987654, 987655], "dhInformado": "2026-08-15 10:22:31" }
+```
+
+> **É "informou", nunca "pago".** A baixa é do financeiro e sai no Sankhya depois — é ela que faz o título deixar a carteira (`DHBAIXA IS NULL` em `SELECT_RECEITAS`). Medido em 15/08: de ~57 títulos que a operadora registrou como pagos no resumo, **só 1 tinha baixa**. A janela entre pagar e sumir da tela é de vários dias, e é ela que faz alguém ligar de novo para quem já pagou.
+
+Implementação, e o porquê de cada escolha:
+
+| Escolha | Motivo |
+|---|---|
+| **Sem tabela nova** | Vira uma chamada `RECEPTIVA` já `FINALIZADA` com `STATUS = INFORMOU_PAGTO` e `DESFECHO = PAGAMENTO_INFORMADO` nos itens. O cliente de fato entrou em contato, então o registro é honesto |
+| **Não anda na régua** | Receptiva nunca incrementa `ORDEM` — marcar pagamento não empurra ninguém ao jurídico |
+| **Não adquire trava** | Não é uma ligação. Travar criaria um "em chamada" falso e um `409` numa ação que precisa ser de dois cliques. Duas pessoas marcando o mesmo título é inofensivo: a leitura usa o registro mais recente |
+| **Comprovante sobe depois** | A rota de anexo precisa de um `CODCHAMADA` existente, então aqui a ordem é inversa à do modal de chamada. Como o comprovante é opcional, falha no upload não invalida o registro — mas a tela **tem** de avisar |
+
+O marcador é lido por `SQL_PAGTO_INFORMADO`, uma consulta **independente** — ela não toca na CTE `REGUA`, que é `PROATIVA`-only por definição. Sai anexado à linha do título em `/api/cobranca/extrato`, no campo `pagamentoInformado`:
+
+```jsonc
+{ "nuFin": 987654, /* ... */
+  "pagamentoInformado": { "dhInformado": "2026-08-15 10:22:31", "codUsu": 43, "nomeUsu": "FABIANA" } }
+```
+
+**Não existe conciliação, por decisão de produto.** Nada cobra o financeiro se a baixa demorar: o app informa, o Sankhya é a fonte da verdade. O badge carrega a data justamente para que um marcador velho pareça velho sozinho.
 
 ### Cobrança — painel da gerência
 

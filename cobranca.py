@@ -789,9 +789,16 @@ def extrato():
 
         cursor = conexao.cursor()
         cursor.execute(CTE_CHEQUES + SELECT_EXTRATO, {"CODPARC": cod_parc})
+        linhas = cursor.fetchall()
+
+        # Marcador de "cliente informou pagamento", anexado à linha em vez de
+        # consultado ao desenhar a célula: assim filtro, contagem e ordenação da
+        # tabela funcionam de graça (mesmo padrão do _cobranca em Títulos
+        # Vencidos). Consulta separada para não tocar na SELECT_EXTRATO.
+        pagtos = _pagtos_informados(cursor, cod_parc)
 
         dados = []
-        for r in cursor.fetchall():
+        for r in linhas:
             dados.append(
                 {
                     "nuFin": r[0],
@@ -814,6 +821,7 @@ def extrato():
                     "situacao": r[17],
                     "operacao": _txt(r[18]),
                     "nuReneg": r[19],
+                    "pagamentoInformado": pagtos.get(int(r[0])) if r[0] is not None else None,
                 }
             )
 
@@ -1105,8 +1113,8 @@ _TRAVA_MINUTOS = 15
 _MAX_TITULOS_CHAMADA = 200
 
 _SENTIDOS = ("PROATIVA", "RECEPTIVA")
-_STATUS_CHAMADA = ("ATENDEU", "CAIXA_POSTAL", "RECUSOU", "AGENDOU")
-_DESFECHOS = ("ACORDO", "SEM_ACORDO", "EM_ABERTO")
+_STATUS_CHAMADA = ("ATENDEU", "CAIXA_POSTAL", "RECUSOU", "AGENDOU", "INFORMOU_PAGTO")
+_DESFECHOS = ("ACORDO", "SEM_ACORDO", "EM_ABERTO", "PAGAMENTO_INFORMADO")
 
 # Travas ativas. Sem filtro de título: quem chama acrescenta o IN quando precisa.
 SQL_TRAVAS = """
@@ -1118,6 +1126,65 @@ SQL_TRAVAS = """
     WHERE c.SITUACAO = 'EM_ANDAMENTO'
       AND c.DHEXPIRA > SYSDATE
 """
+
+# ---------------------------------------------------------------------------
+# Pagamento informado pelo cliente (docs/PAGAMENTO-INFORMADO.md)
+#
+# É "o cliente disse que pagou", NUNCA "pago". A baixa é do financeiro, sai no
+# Sankhya depois, e é ela que faz o título deixar a carteira. Medido em 15/08:
+# de ~57 títulos que a operadora registrou como pagos, só 1 tinha baixa — a
+# janela entre pagar e sumir da tela é de vários dias, e é ela que faz alguém
+# ligar de novo para quem já pagou.
+#
+# Sem tabela nova: o registro é uma chamada RECEPTIVA já FINALIZADA (o cliente
+# de fato entrou em contato) e o marcador vive no DESFECHO do título. Receptiva
+# não conta na régua, então marcar pagamento nunca empurra ninguém ao jurídico.
+# ---------------------------------------------------------------------------
+
+# Sem filtro de SENTIDO de propósito: vale tanto o registro rápido (receptiva)
+# quanto o desfecho marcado durante uma ligação normal. NÃO reaproveita a CTE
+# REGUA, que é PROATIVA-only por definição — misturar as duas coisas quebraria
+# a régua para ganhar um badge.
+SQL_PAGTO_INFORMADO = """
+    SELECT i.NUFIN,
+           MAX(c.DHFIM) AS DHINFORMADO,
+           MAX(c.CODUSU) KEEP (DENSE_RANK LAST ORDER BY c.DHFIM) AS CODUSU,
+           MAX(u.NOMEUSU) KEEP (DENSE_RANK LAST ORDER BY c.DHFIM) AS NOMEUSU
+    FROM AD_COBRCHAMADAITEM i
+    JOIN AD_COBRCHAMADA c ON c.CODCHAMADA = i.CODCHAMADA
+    LEFT JOIN TSIUSU u ON u.CODUSU = c.CODUSU
+    WHERE i.DESFECHO = 'PAGAMENTO_INFORMADO'
+      AND c.SITUACAO = 'FINALIZADA'
+      {filtro_parc}
+    GROUP BY i.NUFIN
+"""
+
+
+def _pagtos_informados(cursor, cod_parc=None):
+    """Índice {nufin: {...}} dos títulos com pagamento informado.
+
+    Consulta à parte, e não JOIN na consulta de títulos: a de extrato/carteira é
+    grande e delicada (CTEs de cheque), e marcador é dado acessório. Mesmo
+    raciocínio do /locks — são poucas linhas, cruzar em Python sai mais barato
+    que carregar a consulta principal.
+
+    Sem cod_parc devolve TODOS os marcadores, para a tela de Títulos Vencidos.
+    """
+    binds = {}
+    filtro = ""
+    if cod_parc is not None:
+        filtro = "AND c.CODPARC = :CODPARC"
+        binds["CODPARC"] = cod_parc
+    cursor.execute(SQL_PAGTO_INFORMADO.format(filtro_parc=filtro), binds)
+    return {
+        int(r[0]): {
+            "dhInformado": _dh(r[1]),
+            "codUsu": int(r[2]) if r[2] is not None else None,
+            "nomeUsu": _txt(r[3]),
+        }
+        for r in cursor.fetchall()
+        if r[0] is not None
+    }
 
 
 class _Invalido(Exception):
@@ -1739,6 +1806,141 @@ def _gravar_anexo(cod_chamada, descricao, url, cod_usu):
                     "codChamada": cod_chamada,
                     "descricao": descricao,
                     "url": url,
+                }
+            ),
+            201,
+        )
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        return _erro_oracle(err)
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/pagamento-informado", methods=["POST"])
+@_exige_operador
+def pagamento_informado():
+    """Registra que o cliente INFORMOU o pagamento de um ou mais títulos.
+
+    Body: { codParc, nufins: [..], obs? }
+    201:  { codChamada, nufins, dhInformado }
+
+    Grava uma chamada RECEPTIVA já FINALIZADA (o cliente entrou em contato) com
+    STATUS='INFORMOU_PAGTO' e DESFECHO='PAGAMENTO_INFORMADO' nos títulos. O
+    codChamada volta para o front pendurar o comprovante na rota de anexo que já
+    existe — aqui o arquivo sobe DEPOIS, ao contrário do modal de chamada, porque
+    a rota de anexo precisa de uma chamada existente. Como o comprovante é
+    opcional, falha no upload não invalida o registro; quem tem de avisar é a
+    tela.
+
+    NÃO ADQUIRE TRAVA, de propósito: isto não é uma ligação. Travar criaria um
+    "em chamada" falso e um 409 numa ação que precisa ser de dois cliques. Duas
+    pessoas marcando o mesmo título é inofensivo — a leitura usa o registro mais
+    recente (KEEP DENSE_RANK LAST em SQL_PAGTO_INFORMADO).
+    """
+    data = request.get_json(silent=True) or {}
+    cod_usu = request.operador["codUsu"]
+    try:
+        cod_parc = _obrig_int(data, "codParc")
+        nufins = _lista_nufins(data)
+        obs = (data.get("obs") or "").strip() or None
+        if obs and len(obs) > 4000:
+            raise _Invalido("'obs' excede 4000 caracteres.")
+    except _Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        placeholders, binds = _binds_lista("N", nufins)
+
+        # Sem FOR UPDATE: não há disputa a serializar, já que não há trava. A
+        # consulta serve só para validar existência e dono do título.
+        cursor.execute(
+            f"SELECT NUFIN, CODPARC FROM TGFFIN WHERE NUFIN IN ({placeholders})",
+            binds,
+        )
+        achados = {
+            int(r[0]): (int(r[1]) if r[1] is not None else None)
+            for r in cursor.fetchall()
+        }
+
+        faltando = [n for n in nufins if n not in achados]
+        if faltando:
+            conexao.rollback()
+            return jsonify({"erro": f"Títulos inexistentes: {faltando}"}), 404
+
+        de_outro = [n for n in nufins if achados[n] != cod_parc]
+        if de_outro:
+            conexao.rollback()
+            return (
+                jsonify(
+                    {
+                        "erro": f"Títulos {de_outro} não pertencem ao cliente {cod_parc}.",
+                        "nufinsInvalidos": de_outro,
+                    }
+                ),
+                400,
+            )
+
+        # Nasce FINALIZADA: não existe rascunho aqui, o registro é instantâneo.
+        # DHEXPIRA = SYSDATE deixa a trava vencida ao nascer, por garantia — se
+        # algum dia SQL_TRAVAS parar de filtrar por SITUACAO, isto ainda não
+        # travaria o título.
+        cod_chamada = _novo_id(
+            cursor,
+            """
+            INSERT INTO AD_COBRCHAMADA
+                (CODCHAMADA, CODPARC, SENTIDO, SITUACAO, DHINICIO, DHEXPIRA,
+                 DHFIM, STATUS, RESUMO, CODUSU)
+            VALUES
+                (SEQ_AD_COBRCHAMADA.NEXTVAL, :CODPARC, 'RECEPTIVA', 'FINALIZADA',
+                 SYSDATE, SYSDATE, SYSDATE, 'INFORMOU_PAGTO', :RESUMO, :CODUSU)
+            RETURNING CODCHAMADA INTO :ID
+            """,
+            {"CODPARC": cod_parc, "RESUMO": obs, "CODUSU": cod_usu},
+        )
+
+        # ORDEM fica NULL: receptiva não anda na régua (mesma regra do
+        # /finalizar). O marcador é o DESFECHO, não a posição.
+        for nufin in nufins:
+            cursor.execute(
+                """
+                INSERT INTO AD_COBRCHAMADAITEM
+                    (CODITEM, CODCHAMADA, NUFIN, DESFECHO)
+                VALUES
+                    (SEQ_AD_COBRCHAMADAITEM.NEXTVAL, :CODCHAMADA, :NUFIN,
+                     'PAGAMENTO_INFORMADO')
+                """,
+                {"CODCHAMADA": cod_chamada, "NUFIN": nufin},
+            )
+
+        cursor.execute(
+            "SELECT DHFIM FROM AD_COBRCHAMADA WHERE CODCHAMADA = :ID",
+            {"ID": cod_chamada},
+        )
+        (dh_fim,) = cursor.fetchone()
+
+        conexao.commit()
+        return (
+            jsonify(
+                {
+                    "sucesso": True,
+                    "codChamada": cod_chamada,
+                    "codParc": cod_parc,
+                    "nufins": nufins,
+                    "dhInformado": _dh(dh_fim),
                 }
             ),
             201,
