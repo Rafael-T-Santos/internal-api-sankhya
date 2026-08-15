@@ -2148,6 +2148,47 @@ def chamadas():
             conexao.close()
 
 
+@bp.route("/api/cobranca/pagamentos-informados", methods=["GET"])
+def pagamentos_informados():
+    """Títulos em que o cliente INFORMOU pagamento — alimenta o badge da lista.
+
+    Query: ?codParc=100 (opcional). Sem filtro devolve todos os marcadores; são
+    poucos por natureza (só existe marcador em título que alguém marcou à mão),
+    então a tela de títulos vencidos cruza em memória em vez de mandar centenas
+    de NUFIN na query string. Mesmo raciocínio do /locks.
+
+    Leitura pura: não exige sessão, como as demais rotas de consulta.
+    """
+    cod_parc = request.args.get("codParc")
+    if cod_parc not in (None, ""):
+        try:
+            cod_parc = int(cod_parc)
+        except ValueError:
+            return jsonify({"erro": "'codParc' deve ser um número."}), 400
+    else:
+        cod_parc = None
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        indice = _pagtos_informados(cursor, cod_parc)
+        dados = [{"nufin": nufin, **info} for nufin, info in sorted(indice.items())]
+
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
 @bp.route("/api/cobranca/locks", methods=["GET"])
 def locks():
     """Títulos em chamada NESTE MOMENTO — alimenta o badge "em chamada por...".

@@ -792,6 +792,17 @@ O marcador é lido por `SQL_PAGTO_INFORMADO`, uma consulta **independente** — 
 
 **Não existe conciliação, por decisão de produto.** Nada cobra o financeiro se a baixa demorar: o app informa, o Sankhya é a fonte da verdade. O badge carrega a data justamente para que um marcador velho pareça velho sozinho.
 
+#### `GET /api/cobranca/pagamentos-informados[?codParc=100]`
+
+Os mesmos marcadores em forma de lista, para a tela de **títulos vencidos** montar o badge de todos os clientes de uma vez.
+
+```jsonc
+{ "sucesso": true, "totalRegistros": 1, "dados": [
+  { "nufin": 987654, "dhInformado": "2026-08-15 10:22:31", "codUsu": 43, "nomeUsu": "FABIANA" } ] }
+```
+
+`codParc` é opcional. Sem ele vêm todos — são poucos por natureza (só existe marcador em título que alguém marcou à mão), então a tela cruza em memória em vez de mandar centenas de `NUFIN` na query string. Mesmo raciocínio do `/locks`. Leitura pura: não exige sessão.
+
 ### Cobrança — painel da gerência
 
 #### `GET /api/cobranca/painel[?codVend=10&codCid=5]`
