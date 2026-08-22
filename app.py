@@ -4,6 +4,7 @@ from flask_cors import CORS
 
 from db import conectar_oracle
 from cobranca import bp as cobranca_bp
+from cnpj import bp as cnpj_bp
 from impostos import (
     bp as impostos_bp,
     limpar_impostos,
@@ -21,6 +22,9 @@ app.register_blueprint(cobranca_bp)
 
 # Rotas do módulo de Impostos / recálculo tributário via API Sankhya (ver impostos.py).
 app.register_blueprint(impostos_bp)
+
+# Rotas do módulo de CNPJ / situação do contribuinte em AL (ver cnpj.py).
+app.register_blueprint(cnpj_bp)
 
 # --- Endpoints da API ---
 

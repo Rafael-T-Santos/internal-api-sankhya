@@ -23,6 +23,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
   - [Produtos](#produtos)
   - [Logística](#logística)
   - [Contagem de estoque](#contagem-de-estoque)
+  - [CNPJ / situação do contribuinte](#cnpj--situação-do-contribuinte)
   - [Cobrança](#cobrança)
   - [Cobrança — operador](#cobrança--operador)
   - [Cobrança — régua de chamadas (escrita)](#cobrança--régua-de-chamadas-escrita)
@@ -78,6 +79,15 @@ Para o recálculo de impostos via API Sankhya (usado no [`/api/cadastrar-produto
 | `SANKHYA_API_BASE` | Base do Gateway (opcional) | Default `https://api.sankhya.com.br`; use `https://api.sandbox.sankhya.com.br` para testar |
 
 > Os três primeiros precisam ser da **mesma aplicação** — misturar Client ID/Secret de uma aplicação com o X-Token de outra é o erro mais comum (`Token e Appkey não associados`).
+
+Para a consulta de CNPJ ([`/api/consultar-cnpj`](#post-apiconsultar-cnpj)):
+
+| Variável | Descrição |
+|---|---|
+| `CNPJWS_TOKEN` | Token da API comercial da [cnpj.ws](https://cnpj.ws) (enviado no header `x_api_token`) |
+| `CNPJWS_DELAY` | Pausa em segundos entre CNPJs de um lote (opcional, default `0.3`) |
+
+> A cnpj.ws é **paga por consulta**. A rota valida o dígito verificador antes de chamar, então CNPJ digitado errado não gasta crédito. A consulta à SEFAZ/AL é pública e não precisa de credencial.
 
 Para a sessão do operador na régua de chamadas:
 
@@ -474,6 +484,93 @@ Grava as quantidades contadas e **fecha a contagem** (`PROCESSADO = 'S'`).
 // 404 — produto fora da contagem (nada foi salvo)
 { "erro": "Produtos não encontrados na contagem 7: [17421]. Nenhuma alteração foi salva." }
 ```
+
+---
+
+### CNPJ / situação do contribuinte
+
+#### `POST /api/consultar-cnpj`
+
+Decide se um CNPJ está **apto a operar em Alagoas** (`active`), cruzando a Receita Federal (via [cnpj.ws](https://cnpj.ws)) com o cadastro da SEFAZ/AL. Implementado em [`cnpj.py`](cnpj.py) — a regra mora só ali, não a reimplemente no consumidor.
+
+**Regra de `active`:**
+
+1. `situacao_cadastral` na Receita precisa ser **`Ativa`**. Se não for, reprova na hora e **nem chega a consultar a SEFAZ**.
+2. Filtra as inscrições estaduais de **AL** (as de outros estados são ignoradas de propósito):
+   - **Nenhuma IE em AL** (isento) → aprova só pela situação cadastral.
+   - **Pelo menos uma IE com `ativo = true`** → aprova.
+   - **Nenhuma ativa** → consulta cada IE na SEFAZ/AL. Basta **uma** `INAPTO` para reprovar — e aí as demais nem são consultadas.
+
+> **Detalhe que quebra silenciosamente:** a cnpj.ws devolve a IE de AL com **9 dígitos** (`240987047`), mas o endpoint da SEFAZ usa o CACEAL de **8**, sem o dígito verificador (`24098704`). Com os 9 dígitos a SEFAZ responde `404`. A conversão está em `numero_caceal()`.
+
+Fontes consultadas:
+
+| Fonte | Endpoint | Autenticação |
+|---|---|---|
+| cnpj.ws | `GET https://comercial.cnpj.ws/cnpj/{cnpj}` | header `x_api_token` (paga) |
+| SEFAZ/AL | `GET https://cadastro.sefaz.al.gov.br/sfz-cadastro-api/api/contribuinte/obterDadosFic/{caceal}` | nenhuma |
+
+```jsonc
+// Request — um CNPJ (aceita com ou sem pontuação)
+{ "cnpj": "12.014.916/0001-80" }
+
+// Request — lote (máximo 100 por requisição)
+{ "cnpjs": ["12014916000180", "..."] }
+```
+
+```jsonc
+// 200 — registro único
+{
+  "sucesso": true,
+  "cnpj": "12014916000180",
+  "active": false,
+  "motivo": "IE 240987047 (AL) está INAPTO na SEFAZ - OMISSAO DE DECLARACAO",
+  "razaoSocial": "GIVONILDO GUEDES DOS SANTOS",
+  "nomeFantasia": null,
+  "situacaoCadastral": "Ativa",
+  "uf": "AL",
+  "inscricoesEstaduaisAl": [
+    { "inscricaoEstadual": "248173391", "ativo": false,
+      "sefaz": { "situacaoCadastral": "DESENQUADRAMENTO", "motivo": "MOTIVO GERAL",
+                 "dataAlteracao": "2009-03-09T15:10:23-03:00" } },
+    { "inscricaoEstadual": "240987047", "ativo": false,
+      "sefaz": { "situacaoCadastral": "INAPTO", "motivo": "OMISSAO DE DECLARACAO",
+                 "dataAlteracao": "2023-03-21T15:44:50-03:00" } }
+  ]
+}
+
+// 200 — lote (um objeto por CNPJ, no mesmo formato acima)
+{ "sucesso": true, "totalRegistros": 2, "dados": [ { ... }, { ... } ] }
+
+// 400 — body ausente, CNPJ inválido, lote acima de 100
+{ "erro": "CNPJ inválido (não tem 14 dígitos ou o dígito verificador não confere)" }
+
+// 500 — CNPJWS_TOKEN não configurado
+{ "erro": "Credencial da cnpj.ws (CNPJWS_TOKEN) não configurada nas variáveis de ambiente." }
+```
+
+**`active` tem três valores, não dois:**
+
+| Valor | Significado |
+|---|---|
+| `true` | Passou na regra |
+| `false` | Reprovado — `motivo` diz qual regra falhou (inclui CNPJ não encontrado na Receita) |
+| `null` | **Indeterminado**: a cnpj.ws ou a SEFAZ não responderam, ou o CNPJ é inválido. Não é reprovação — repita a consulta depois |
+
+> O `null` existe de propósito: devolver `false` quando a SEFAZ está fora do ar bloquearia clientes bons por indisponibilidade. **Quem consome precisa tratar os três casos** — um `if (!active)` trata indisponibilidade como reprovação.
+
+#### `GET /api/consultar-cnpj/{cnpj}`
+
+Mesma regra, mesma resposta e mesmos códigos de erro do `POST` acima — só muda a forma de mandar o CNPJ. Serve para **um CNPJ por vez**; para lote, use o `POST`.
+
+```
+GET /api/consultar-cnpj/12014916000180
+GET /api/consultar-cnpj/12.014.916/0001-80
+```
+
+Aceita com ou sem máscara. A rota usa o conversor `path:` do Flask (e não o `string:` padrão) porque a máscara do CNPJ tem uma **barra** — com o conversor padrão, o formato pontuado devolvia `404` antes de chegar na função.
+
+O corpo da resposta é idêntico ao do `POST /api/consultar-cnpj` com `{ "cnpj": "..." }`, incluindo o `400` de CNPJ inválido.
 
 ---
 
