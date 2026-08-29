@@ -6,7 +6,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
 
 | Arquivo | O que tem |
 |---|---|
-| [app.py](app.py) | Produtos, logística, contagem de estoque — e o registro dos blueprints |
+| [app.py](app.py) | Produtos, logística, contagem de estoque, conferência de entrada — e o registro dos blueprints |
 | [cobranca.py](cobranca.py) | Blueprint da Cobrança: listas de apoio, inadimplência, Visão 360°, login do operador e a régua de chamadas |
 | [drive.py](drive.py) | Envio dos anexos de cobrança para o Google Drive da empresa |
 | [impostos.py](impostos.py) | Recálculo de impostos via Gateway do Sankhya (`autenticar_sankhya` é reaproveitada pela cobrança) |
@@ -23,6 +23,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
   - [Produtos](#produtos)
   - [Logística](#logística)
   - [Contagem de estoque](#contagem-de-estoque)
+  - [Conferência de entrada](#conferência-de-entrada)
   - [CNPJ / situação do contribuinte](#cnpj--situação-do-contribuinte)
   - [Cobrança](#cobrança)
   - [Cobrança — operador](#cobrança--operador)
@@ -483,6 +484,109 @@ Grava as quantidades contadas e **fecha a contagem** (`PROCESSADO = 'S'`).
 
 // 404 — produto fora da contagem (nada foi salvo)
 { "erro": "Produtos não encontrados na contagem 7: [17421]. Nenhuma alteração foi salva." }
+```
+
+---
+
+### Conferência de entrada
+
+Recebimento de mercadorias. Mesmo desenho da contagem de estoque: lista o que há para conferir → busca os itens de uma conferência → grava o resultado.
+
+A conferência é **cega**: o conferente conta o que está na doca sem ver a quantidade da nota, e só descobre se bateu ou não. Por isso `qtd_esperada` sai apenas em [`/api/itens-conferencia-entrada`](#post-apiitens-conferencia-entrada), que é **servidor-para-servidor** — quem chama é o backend do Check My Load, que guarda o valor e nunca o repassa ao aplicativo.
+
+Estados de `AD_CONF_ENT_CAB.STATUS`:
+
+```
+EM_CONFERENCIA ──▶ AGUARDANDO_LIBERACAO ──▶ CONCLUIDA_COM_DIVERGENCIA
+               └─▶ CONCLUIDA_SEM_DIVERGENCIA
+CANCELADA a qualquer momento.
+```
+
+#### `GET /api/conferencias-entrada-pendentes`
+
+Conferências ainda abertas (`STATUS` em `EM_CONFERENCIA` ou `AGUARDANDO_LIBERACAO`), com o nome do fornecedor vindo de `TGFPAR`.
+
+Sem parâmetros. `dtprevista` sai como texto `YYYY-MM-DD`, não como data serializada — o `jsonify` do Flask escreve `DATE` em RFC 822 (`"Wed, 02 Sep 2026 00:00:00 GMT"`), e isso lido em UTC-3 vira o dia anterior na tela.
+
+```jsonc
+// 200
+{
+  "sucesso": true,
+  "totalRegistros": 1,
+  "dados": [
+    {
+      "nuconf": 1, "nunota": 55001, "codemp": 1, "numnota": 12345,
+      "codparc": 42, "fornecedor": "FORTLEV INDUSTRIA",
+      "dtprevista": "2026-09-02", "qtdvolumes": 30, "status": "EM_CONFERENCIA"
+    }
+  ]
+}
+```
+
+---
+
+#### `POST /api/itens-conferencia-entrada`
+
+Itens de uma conferência, com a quantidade esperada congelada no lançamento.
+
+`SEQCONF` e `DESCRPROD_SNAP` saem com alias `sequencia` e `descrprod`, para o consumidor não depender do nome físico da coluna.
+
+```jsonc
+// Request
+{ "nuConf": 1 }
+```
+
+```jsonc
+// 200
+{
+  "sucesso": true,
+  "totalRegistros": 1,
+  "dados": [
+    {
+      "nuconf": 1, "sequencia": 1, "sequencia_orig": 1, "codprod": 1001,
+      "descrprod": "Caixa d'água 500L", "marca": "FORTLEV", "unidade": "UN",
+      "ean13": "7891234567895", "ean14": "17891234567892",
+      "fator_ean14": 12, "qtd_esperada": 36
+    }
+  ]
+}
+```
+
+---
+
+#### `POST /api/registrar-conferencia-entrada`
+
+Grava o resultado da conferência e move o cabeçalho para o status final. `DHFIM` só é carimbado quando o status começa com `CONCLUIDA` — uma devolução para nova conferência volta a `EM_CONFERENCIA` e limpa o carimbo, senão o tempo de conferência contaria um fim que não aconteceu.
+
+**Tudo ou nada:** se qualquer `seqConf` não existir naquela conferência, a operação inteira sofre rollback — a resposta `404` lista as sequências que não bateram. O mesmo vale se o `nuConf` não existir.
+
+`statusItem` é opcional; omitido, o valor atual da coluna é preservado. `observacao` é opcional e sobrescreve.
+
+```jsonc
+// Request
+{
+  "nuConf": 1,
+  "status": "CONCLUIDA_COM_DIVERGENCIA",
+  "itens": [
+    { "seqConf": 1, "codProd": 1001, "qtdConferida": 36, "statusItem": "OK" },
+    { "seqConf": 2, "codProd": 1002, "qtdConferida": 8, "statusItem": "DIVERGENTE",
+      "observacao": "Faltaram 2, embalagem violada" }
+  ]
+}
+```
+
+```jsonc
+// 200
+{ "sucesso": true, "mensagem": "2 item(ns) registrado(s) e conferência 1 marcada como CONCLUIDA_COM_DIVERGENCIA." }
+
+// 400 — status fora da lista
+{ "erro": "Status 'FINALIZADA' inválido. Use um de: EM_CONFERENCIA, AGUARDANDO_LIBERACAO, CONCLUIDA_SEM_DIVERGENCIA, CONCLUIDA_COM_DIVERGENCIA, CANCELADA." }
+
+// 400 — item malformado
+{ "erro": "Item na posição 1 deve conter 'seqConf' e 'qtdConferida'." }
+
+// 404 — sequência fora da conferência (nada foi salvo)
+{ "erro": "Sequências não encontradas na conferência 1: [9]. Nenhuma alteração foi salva." }
 ```
 
 ---
@@ -988,7 +1092,7 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 
 Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
 
-**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
+**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
 

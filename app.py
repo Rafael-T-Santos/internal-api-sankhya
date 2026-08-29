@@ -1002,3 +1002,263 @@ def registrar_contagem():
     finally:
         if conexao:
             conexao.close()
+
+
+# --- Conferência de entrada (recebimento de mercadorias) ---
+# Espelham as três rotas da contagem de estoque acima: lista o que há para
+# conferir, busca os itens de uma conferência e grava o resultado.
+#
+# Estados de AD_CONF_ENT_CAB.STATUS, na ordem em que acontecem:
+#   EM_CONFERENCIA -> AGUARDANDO_LIBERACAO -> CONCLUIDA_COM_DIVERGENCIA
+#                  \-> CONCLUIDA_SEM_DIVERGENCIA
+#   CANCELADA a qualquer momento.
+
+STATUS_CONF_ENTRADA_VALIDOS = (
+    "EM_CONFERENCIA",
+    "AGUARDANDO_LIBERACAO",
+    "CONCLUIDA_SEM_DIVERGENCIA",
+    "CONCLUIDA_COM_DIVERGENCIA",
+    "CANCELADA",
+)
+
+STATUS_ITEM_CONF_ENTRADA_VALIDOS = ("PENDENTE", "OK", "DIVERGENTE")
+
+
+@app.route("/api/conferencias-entrada-pendentes", methods=["GET"])
+def conferencias_entrada_pendentes():
+    # DTPREVISTA sai como texto ISO de propósito. O jsonify do Flask serializa
+    # DATE em RFC 822 ("Wed, 02 Sep 2026 00:00:00 GMT"); lido em UTC-3, isso
+    # vira o dia anterior na tela do conferente. Data prevista não tem hora,
+    # então mandar só a data elimina o problema na origem.
+    sql = """
+    SELECT C.NUCONF,
+           C.NUNOTA,
+           C.CODEMP,
+           C.NUMNOTA,
+           C.CODPARC,
+           P.NOMEPARC AS FORNECEDOR,
+           TO_CHAR(C.DTPREVISTA, 'YYYY-MM-DD') AS DTPREVISTA,
+           C.QTDVOLUMES,
+           C.STATUS
+    FROM AD_CONF_ENT_CAB C
+    LEFT JOIN TGFPAR P ON P.CODPARC = C.CODPARC
+    WHERE C.STATUS IN ('EM_CONFERENCIA', 'AGUARDANDO_LIBERACAO')
+    ORDER BY C.DTPREVISTA NULLS LAST, C.NUCONF
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql)
+        colunas = [col[0].lower() for col in cursor.description]
+        resultados = cursor.fetchall()
+
+        dados = [dict(zip(colunas, row)) for row in resultados]
+
+        return jsonify({
+            "sucesso": True,
+            "totalRegistros": len(dados),
+            "dados": dados
+        })
+
+    except cx_Oracle.Error as err:
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@app.route("/api/itens-conferencia-entrada", methods=["POST"])
+def itens_conferencia_entrada():
+    data = request.get_json()
+    if not data:
+        return jsonify({"erro": "Nenhum dado recebido"}), 400
+
+    nu_conf = data.get("nuConf")
+    if not nu_conf:
+        return jsonify({"erro": "Parâmetro 'nuConf' é obrigatório."}), 400
+
+    # Os alias existem para o consumidor não depender do nome físico da coluna:
+    # SEQCONF/DESCRPROD_SNAP viriam como `seqconf`/`descrprod_snap` num
+    # SELECT *, e é `sequencia`/`descrprod` que o Check My Load espera.
+    #
+    # QTD_ESPERADA vai no retorno, e é a razão de esta rota ser
+    # servidor-para-servidor: quem chama é o backend do Check My Load, que
+    # guarda o valor e nunca o repassa ao aplicativo do conferente. A
+    # conferência é cega — se o valor chegasse ao aparelho, contar viraria
+    # confirmar.
+    sql = """
+    SELECT I.NUCONF,
+           I.SEQCONF        AS SEQUENCIA,
+           I.SEQUENCIA_ORIG,
+           I.CODPROD,
+           I.DESCRPROD_SNAP AS DESCRPROD,
+           I.MARCA,
+           I.UNIDADE,
+           I.EAN13,
+           I.EAN14,
+           I.FATOR_EAN14,
+           I.QTD_ESPERADA
+    FROM AD_CONF_ENT_ITE I
+    WHERE I.NUCONF = :NUCONF
+    ORDER BY I.SEQCONF
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql, {"NUCONF": nu_conf})
+        colunas = [col[0].lower() for col in cursor.description]
+        resultados = cursor.fetchall()
+
+        dados = [dict(zip(colunas, row)) for row in resultados]
+
+        return jsonify({
+            "sucesso": True,
+            "totalRegistros": len(dados),
+            "dados": dados
+        })
+
+    except cx_Oracle.Error as err:
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@app.route("/api/registrar-conferencia-entrada", methods=["POST"])
+def registrar_conferencia_entrada():
+    data = request.get_json()
+    if not data:
+        return jsonify({"erro": "Nenhum dado recebido"}), 400
+
+    nu_conf = data.get("nuConf")
+    status = data.get("status")
+    itens = data.get("itens", [])
+
+    if not nu_conf:
+        return jsonify({"erro": "Parâmetro 'nuConf' é obrigatório."}), 400
+    if not status:
+        return jsonify({"erro": "Parâmetro 'status' é obrigatório."}), 400
+    if status not in STATUS_CONF_ENTRADA_VALIDOS:
+        return jsonify({
+            "erro": f"Status '{status}' inválido. Use um de: {', '.join(STATUS_CONF_ENTRADA_VALIDOS)}."
+        }), 400
+    if not itens:
+        return jsonify({"erro": "Parâmetro 'itens' é obrigatório e não pode ser vazio."}), 400
+
+    for i, item in enumerate(itens):
+        if item.get("seqConf") is None or item.get("qtdConferida") is None:
+            return jsonify({
+                "erro": f"Item na posição {i} deve conter 'seqConf' e 'qtdConferida'."
+            }), 400
+        status_item = item.get("statusItem")
+        if status_item is not None and status_item not in STATUS_ITEM_CONF_ENTRADA_VALIDOS:
+            return jsonify({
+                "erro": f"Item na posição {i} tem 'statusItem' inválido: '{status_item}'. "
+                        f"Use um de: {', '.join(STATUS_ITEM_CONF_ENTRADA_VALIDOS)}."
+            }), 400
+
+    sql_item = """
+    UPDATE AD_CONF_ENT_ITE
+    SET QTD_CONFERIDA = :QTD_CONFERIDA,
+        STATUS_ITEM   = NVL(:STATUS_ITEM, STATUS_ITEM),
+        OBSERVACAO    = :OBSERVACAO
+    WHERE NUCONF  = :NUCONF
+      AND SEQCONF = :SEQCONF
+    """
+
+    # DHFIM só é carimbado ao concluir. Uma devolução para nova conferência
+    # manda o status de volta para EM_CONFERENCIA, e aí a conferência ainda
+    # não acabou — deixar o carimbo antigo faria o relatório de tempo médio
+    # contar um fim que não aconteceu.
+    sql_cabecalho = """
+    UPDATE AD_CONF_ENT_CAB
+    SET STATUS = :STATUS,
+        DHFIM  = CASE WHEN :STATUS LIKE 'CONCLUIDA%' THEN SYSDATE ELSE NULL END
+    WHERE NUCONF = :NUCONF
+    """
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+
+        # Sem pinar os tipos, o cx_Oracle infere o bind a partir do primeiro
+        # item do laço. Se esse item vier com observacao nula, o bind fica
+        # gravado como NULL e o próximo item com texto — ou com texto mais
+        # longo que o primeiro — falha no meio da transação.
+        cursor.setinputsizes(
+            QTD_CONFERIDA=cx_Oracle.NUMBER,
+            STATUS_ITEM=15,
+            OBSERVACAO=4000,
+            NUCONF=cx_Oracle.NUMBER,
+            SEQCONF=cx_Oracle.NUMBER,
+        )
+
+        nao_encontrados = []
+        for item in itens:
+            cursor.execute(sql_item, {
+                "QTD_CONFERIDA": item["qtdConferida"],
+                "STATUS_ITEM": item.get("statusItem"),
+                "OBSERVACAO": item.get("observacao"),
+                "NUCONF": nu_conf,
+                "SEQCONF": item["seqConf"],
+            })
+            if cursor.rowcount == 0:
+                nao_encontrados.append(item["seqConf"])
+
+        if nao_encontrados:
+            conexao.rollback()
+            return jsonify({
+                "erro": f"Sequências não encontradas na conferência {nu_conf}: "
+                        f"{nao_encontrados}. Nenhuma alteração foi salva."
+            }), 404
+
+        cursor.execute(sql_cabecalho, {"STATUS": status, "NUCONF": nu_conf})
+        if cursor.rowcount == 0:
+            conexao.rollback()
+            return jsonify({
+                "erro": f"Conferência {nu_conf} não encontrada. Nenhuma alteração foi salva."
+            }), 404
+
+        conexao.commit()
+
+        return jsonify({
+            "sucesso": True,
+            "mensagem": f"{len(itens)} item(ns) registrado(s) e conferência {nu_conf} "
+                        f"marcada como {status}."
+        })
+
+    except cx_Oracle.Error as err:
+        if conexao:
+            conexao.rollback()
+        print("Erro Oracle:", err)
+        return jsonify({"erro": f"Erro de Banco de Dados: {err}"}), 500
+    except Exception as e:
+        if conexao:
+            conexao.rollback()
+        print("Erro Geral:", e)
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        if conexao:
+            conexao.close()
