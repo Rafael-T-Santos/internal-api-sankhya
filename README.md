@@ -599,20 +599,23 @@ Decide se um CNPJ está **apto a operar em Alagoas** (`active`), cruzando a Rece
 
 **Regra de `active`:**
 
-1. `situacao_cadastral` na Receita precisa ser **`Ativa`**. Se não for, reprova na hora e **nem chega a consultar a SEFAZ**.
-2. Filtra as inscrições estaduais de **AL** (as de outros estados são ignoradas de propósito):
-   - **Nenhuma IE em AL** (isento) → aprova só pela situação cadastral.
-   - **Pelo menos uma IE com `ativo = true`** → aprova.
-   - **Nenhuma ativa** → consulta cada IE na SEFAZ/AL. Basta **uma** `INAPTO` para reprovar — e aí as demais nem são consultadas.
+1. `situacao_cadastral` na Receita (cnpj.ws) precisa ser **`Ativa`**. Se não for, reprova na hora e **nem chega a consultar a SEFAZ**.
+2. Busca as inscrições estaduais **direto na SEFAZ/AL pelo CNPJ** — um CNPJ pode ter vários CACEAIs (o atual e os históricos):
+   - **Nenhuma inscrição** (isento, empresa de fora do estado, ou só cadastro de pessoa sem CACEAL) → aprova só pela situação cadastral.
+   - **Pelo menos uma com `situacaoCadastralContribuinte = ATIVO`** → aprova. As outras (`BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) **não atrapalham** — são inscrições antigas do mesmo CNPJ.
+   - **Nenhuma `ATIVO`** → reprova, e o `motivo` lista a situação de cada uma.
+   - **Alguma inscrição sem situação informada** (CACEAL preenchido, `situacaoCadastralContribuinte` nulo) → `active: null`. Dado que a SEFAZ não informou não vira reprovação.
 
-> **Detalhe que quebra silenciosamente:** a cnpj.ws devolve a IE de AL com **9 dígitos** (`240987047`), mas o endpoint da SEFAZ usa o CACEAL de **8**, sem o dígito verificador (`24098704`). Com os 9 dígitos a SEFAZ responde `404`. A conversão está em `numero_caceal()`.
+> **As inscrições estaduais da cnpj.ws não são usadas.** A flag `ativo` de lá se mostrou não confiável (desatualizada em relação ao cadastro do estado) — da cnpj.ws vêm só a situação na Receita e os dados de identificação. Quem manda sobre IE de AL é a SEFAZ.
+
+> **Detalhe do payload da SEFAZ:** a inscrição vem partida em `numeroCaceal` (8 dígitos) + `digitoCaceal`. A resposta desta API devolve os dois: `inscricaoEstadual` com os **9 dígitos** juntos (o formato usado na nota fiscal e no Sankhya) e `numeroCaceal` com os 8. Itens com `numeroCaceal: null` são cadastro de pessoa sem inscrição — a SEFAZ devolve o CNPJ com endereço em AL, `situacaoCadastralContribuinte: null` e só o `situacaoCadastralPj` preenchido. São descartados, e um CNPJ que só tenha itens assim conta como **isento** (ex.: `00816565000141`).
 
 Fontes consultadas:
 
 | Fonte | Endpoint | Autenticação |
 |---|---|---|
 | cnpj.ws | `GET https://comercial.cnpj.ws/cnpj/{cnpj}` | header `x_api_token` (paga) |
-| SEFAZ/AL | `GET https://cadastro.sefaz.al.gov.br/sfz-cadastro-api/api/contribuinte/obterDadosFic/{caceal}` | nenhuma |
+| SEFAZ/AL | `GET https://cadastro.sefaz.al.gov.br/sfz-cadastro-api/api/contribuinte/obterListaContribuintes/CNPJ/{cnpj}/{pagina}/{tamanho}` | nenhuma |
 
 ```jsonc
 // Request — um CNPJ (aceita com ou sem pontuação)
@@ -628,18 +631,37 @@ Fontes consultadas:
   "sucesso": true,
   "cnpj": "12014916000180",
   "active": false,
-  "motivo": "IE 240987047 (AL) está INAPTO na SEFAZ - OMISSAO DE DECLARACAO",
+  "motivo": "Nenhuma IE de AL ativa na SEFAZ (248173391=DESENQUADRAMENTO (MOTIVO GERAL), 240987047=INAPTO (OMISSAO DE DECLARACAO))",
   "razaoSocial": "GIVONILDO GUEDES DOS SANTOS",
   "nomeFantasia": null,
   "situacaoCadastral": "Ativa",
   "uf": "AL",
   "inscricoesEstaduaisAl": [
-    { "inscricaoEstadual": "248173391", "ativo": false,
-      "sefaz": { "situacaoCadastral": "DESENQUADRAMENTO", "motivo": "MOTIVO GERAL",
-                 "dataAlteracao": "2009-03-09T15:10:23-03:00" } },
-    { "inscricaoEstadual": "240987047", "ativo": false,
-      "sefaz": { "situacaoCadastral": "INAPTO", "motivo": "OMISSAO DE DECLARACAO",
-                 "dataAlteracao": "2023-03-21T15:44:50-03:00" } }
+    { "inscricaoEstadual": "248173391", "numeroCaceal": "24817339", "ativo": false,
+      "situacaoCadastral": "DESENQUADRAMENTO", "motivo": "MOTIVO GERAL",
+      "dataAlteracao": "2009-03-09 15:10:23.0" },
+    { "inscricaoEstadual": "240987047", "numeroCaceal": "24098704", "ativo": false,
+      "situacaoCadastral": "INAPTO", "motivo": "OMISSAO DE DECLARACAO",
+      "dataAlteracao": "2023-03-21 15:44:50.0" }
+  ]
+}
+
+// 200 — CNPJ com IE baixada + IE ativa: a ativa manda, o histórico não reprova
+{
+  "sucesso": true,
+  "cnpj": "51134604000161",
+  "active": true,
+  "motivo": "Situação cadastral Ativa e IE ativa na SEFAZ/AL (241404738)",
+  "razaoSocial": "51.134.604 MARLUCE FRANCA BARROS",
+  "situacaoCadastral": "Ativa",
+  "uf": "AL",
+  "inscricoesEstaduaisAl": [
+    { "inscricaoEstadual": "240641353", "numeroCaceal": "24064135", "ativo": false,
+      "situacaoCadastral": "BAIXA", "motivo": "TRANSFERENCIA PARA OUTRA UNIDADE DA FEDERACAO",
+      "dataAlteracao": "2024-07-01 09:53:26.0" },
+    { "inscricaoEstadual": "241404738", "numeroCaceal": "24140473", "ativo": true,
+      "situacaoCadastral": "ATIVO", "motivo": "INSCRICAO REGULAR",
+      "dataAlteracao": "2024-12-11 17:35:34.0" }
   ]
 }
 
@@ -659,7 +681,18 @@ Fontes consultadas:
 |---|---|
 | `true` | Passou na regra |
 | `false` | Reprovado — `motivo` diz qual regra falhou (inclui CNPJ não encontrado na Receita) |
-| `null` | **Indeterminado**: a cnpj.ws ou a SEFAZ não responderam, ou o CNPJ é inválido. Não é reprovação — repita a consulta depois |
+| `null` | **Indeterminado**: a cnpj.ws ou a SEFAZ não responderam, o CNPJ é inválido, ou a SEFAZ não informou a situação de uma inscrição. Não é reprovação — repita a consulta depois |
+
+**Campos de cada item de `inscricoesEstaduaisAl`:**
+
+| Campo | Origem na SEFAZ |
+|---|---|
+| `inscricaoEstadual` | `numeroCaceal` + `digitoCaceal` (9 dígitos) |
+| `numeroCaceal` | `numeroCaceal` (8 dígitos, sem o DV) |
+| `ativo` | `true` só quando `situacaoCadastralContribuinte` é `ATIVO` |
+| `situacaoCadastral` | `situacaoCadastralContribuinte` (`ATIVO`, `BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) |
+| `motivo` | `descricaoMotivoSituacaoCadastral` |
+| `dataAlteracao` | `dataAlteracaoSituacaoCastral` (o nome com erro de digitação é da SEFAZ) |
 
 > O `null` existe de propósito: devolver `false` quando a SEFAZ está fora do ar bloquearia clientes bons por indisponibilidade. **Quem consome precisa tratar os três casos** — um `if (!active)` trata indisponibilidade como reprovação.
 

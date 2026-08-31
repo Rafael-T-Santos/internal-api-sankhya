@@ -2,10 +2,14 @@
 
 Combina duas fontes externas:
 
-1. **cnpj.ws** (paga, token por header `x_api_token`) — situação cadastral na Receita
-   Federal e a lista de inscrições estaduais com a flag `ativo`.
-2. **SEFAZ/AL** (pública, sem autenticação) — situação cadastral da inscrição estadual
-   (CACEAL), consultada só quando a cnpj.ws diz que nenhuma IE de AL está ativa.
+1. **cnpj.ws** (paga, token por header `x_api_token`) — usada só para a situação
+   cadastral na Receita Federal e os dados de identificação (razão social, fantasia).
+2. **SEFAZ/AL** (pública, sem autenticação) — busca as inscrições estaduais direto pelo
+   CNPJ e a situação de cada uma.
+
+As inscrições estaduais da cnpj.ws **não são usadas**: a flag `ativo` de lá se mostrou
+não confiável (desatualizada em relação ao cadastro do estado). Quem manda sobre IE de AL
+é a SEFAZ, e a lista vem dela pelo CNPJ — não há mais consulta por CACEAL.
 
 A regra de `active` está em `avaliar_cnpj()` — é a única fonte de verdade do critério e
 qualquer consumidor (incluindo o job de lote do projeto enriquecimento-cnpjws) deve
@@ -24,7 +28,10 @@ from flask import Blueprint, jsonify, request
 bp = Blueprint("cnpj", __name__)
 
 CNPJWS_URL = "https://comercial.cnpj.ws/cnpj/"
-SEFAZ_AL_URL = "https://cadastro.sefaz.al.gov.br/sfz-cadastro-api/api/contribuinte/obterDadosFic/"
+SEFAZ_AL_LISTA_URL = (
+    "https://cadastro.sefaz.al.gov.br/sfz-cadastro-api/api/contribuinte/"
+    "obterListaContribuintes/CNPJ/"
+)
 
 # Timeout (segundos) das chamadas HTTP externas.
 _TIMEOUT = 30
@@ -35,15 +42,24 @@ _MAX_TENTATIVAS = 4
 # Pausa entre CNPJs num lote, para respeitar o rate limit da cnpj.ws.
 _DELAY_LOTE = float(os.environ.get("CNPJWS_DELAY", "0.3"))
 
-# Teto de CNPJs por requisição: cada um pode gastar 1 chamada na cnpj.ws + N na SEFAZ,
-# então um lote grande demais estouraria o timeout do cliente HTTP.
+# Teto de CNPJs por requisição: cada um gasta 1 chamada na cnpj.ws + 1 na SEFAZ, então um
+# lote grande demais estouraria o timeout do cliente HTTP.
 _MAX_LOTE = 100
 
 # Situação da Receita que aprova o CNPJ. Comparada sem acento/caixa.
 _SITUACAO_APROVADA = "ativa"
 
-# Situação da SEFAZ/AL que reprova a inscrição estadual.
-_SITUACAO_SEFAZ_REPROVADA = "INAPTO"
+# Situação da inscrição estadual na SEFAZ/AL que aprova. As demais que aparecem no
+# cadastro (BAIXA, INAPTO, DESENQUADRAMENTO...) não aprovam sozinhas, mas também não
+# reprovam se houver outra IE ATIVO — costumam ser inscrições históricas do mesmo CNPJ.
+_SITUACAO_SEFAZ_ATIVA = "ATIVO"
+
+# Paginação do endpoint de lista da SEFAZ (a URL termina em /{pagina}/{tamanho}).
+_SEFAZ_TAMANHO_PAGINA = 50
+
+# Trava de segurança: um CNPJ com mais páginas que isso é caso patológico, não vale
+# manter o cliente esperando.
+_SEFAZ_MAX_PAGINAS = 5
 
 UF_ALVO = "AL"
 
@@ -145,39 +161,44 @@ def _retry_after(resp, padrao):
         return padrao
 
 
-def numero_caceal(inscricao_estadual):
-    """Converte a IE de AL no número que a SEFAZ espera na URL.
+def consultar_sefaz_al(cnpj):
+    """Lista as inscrições estaduais de AL do CNPJ na SEFAZ.
 
-    A cnpj.ws devolve a inscrição completa com 9 dígitos (ex.: "240987047"), mas o
-    endpoint da SEFAZ usa só o CACEAL de 8 dígitos, SEM o dígito verificador
-    ("24098704") — com os 9 dígitos ele responde 404. Devolve None se não der para
-    normalizar.
+    Devolve (contribuintes, erro) — um dos dois é sempre None. `contribuintes` é a lista
+    crua do campo `content` da SEFAZ, já concatenada de todas as páginas; lista vazia
+    significa CNPJ sem cadastro no estado (isento), não falha.
+
+    A busca é feita pelo CNPJ, então um mesmo CNPJ pode devolver vários CACEAIs (o atual
+    e os históricos, como uma inscrição baixada por transferência de UF).
     """
-    if not inscricao_estadual:
-        return None
-    digitos = re.sub(r"\D", "", str(inscricao_estadual))
-    if len(digitos) == 9:
-        return digitos[:8]
-    if len(digitos) == 8:
-        return digitos
-    return None
+    contribuintes = []
+    pagina = 0
+    while pagina < _SEFAZ_MAX_PAGINAS:
+        url = f"{SEFAZ_AL_LISTA_URL}{cnpj}/{pagina}/{_SEFAZ_TAMANHO_PAGINA}"
+        dados, erro = _get_sefaz(url)
+        if erro:
+            return None, erro
+
+        contribuintes.extend(dados.get("content") or [])
+
+        pagina += 1
+        if dados.get("last") or pagina >= (dados.get("totalPages") or 1):
+            break
+
+    return contribuintes, None
 
 
-def consultar_sefaz_al(inscricao_estadual):
-    """Consulta a situação da IE na SEFAZ/AL.
+def _get_sefaz(url):
+    """GET na SEFAZ/AL com retentativa em 5xx. Devolve (json, erro).
 
-    Devolve (info, erro) — um dos dois é sempre None. `info` traz
-    {"situacaoCadastral", "motivo", "dataAlteracao"}.
+    `404` não é erro: o endpoint responde assim quando o CNPJ não tem cadastro no estado,
+    o que é o mesmo que uma lista vazia.
     """
-    caceal = numero_caceal(inscricao_estadual)
-    if not caceal:
-        return None, f"Inscrição estadual '{inscricao_estadual}' fora do formato de AL"
-
     tentativa = 0
     while True:
         tentativa += 1
         try:
-            resp = requests.get(SEFAZ_AL_URL + caceal, timeout=_TIMEOUT)
+            resp = requests.get(url, timeout=_TIMEOUT)
         except requests.RequestException as err:
             if tentativa < _MAX_TENTATIVAS:
                 time.sleep(2 * tentativa)
@@ -186,18 +207,12 @@ def consultar_sefaz_al(inscricao_estadual):
 
         if resp.status_code == 200:
             try:
-                dados = resp.json()
+                return resp.json(), None
             except ValueError:
                 return None, f"SEFAZ/AL devolveu corpo não-JSON: {resp.text[:200]}"
-            recente = dados.get("situacaoCadastralRecente") or {}
-            return {
-                "situacaoCadastral": recente.get("situacaoCadastral"),
-                "motivo": dados.get("motivoSituacaoCadastral"),
-                "dataAlteracao": recente.get("dataAlteracaoSituacaoCadastral"),
-            }, None
 
         if resp.status_code == 404:
-            return None, f"Inscrição estadual {inscricao_estadual} não encontrada na SEFAZ/AL"
+            return {"content": [], "last": True, "totalPages": 1}, None
 
         if resp.status_code >= 500 and tentativa < _MAX_TENTATIVAS:
             time.sleep(2 * tentativa)
@@ -206,34 +221,57 @@ def consultar_sefaz_al(inscricao_estadual):
         return None, f"SEFAZ/AL HTTP {resp.status_code}: {resp.text[:200]}"
 
 
+def _normalizar_contribuinte(item):
+    """Reduz um item da SEFAZ ao que a resposta da rota expõe."""
+    identificacao = item.get("identificacao") or {}
+    situacao = item.get("situacaoCadastral") or {}
+    caceal = item.get("numeroCaceal") or identificacao.get("numeroCaceal")
+    situacao_ie = (situacao.get("situacaoCadastralContribuinte") or "").strip().upper()
+
+    return {
+        "inscricaoEstadual": _inscricao_completa(caceal, identificacao.get("digitoCaceal")),
+        "numeroCaceal": str(caceal) if caceal is not None else None,
+        "ativo": situacao_ie == _SITUACAO_SEFAZ_ATIVA,
+        "situacaoCadastral": situacao.get("situacaoCadastralContribuinte"),
+        "motivo": situacao.get("descricaoMotivoSituacaoCadastral"),
+        # O nome do campo é "Castral" mesmo — erro de digitação da API da SEFAZ.
+        "dataAlteracao": situacao.get("dataAlteracaoSituacaoCastral"),
+    }
+
+
+def _inscricao_completa(caceal, digito):
+    """Monta a IE de 9 dígitos a partir do CACEAL (8) + dígito verificador.
+
+    A SEFAZ devolve os dois separados (`numeroCaceal` e `digitoCaceal`), mas o resto do
+    mundo — nota fiscal, cadastro do Sankhya — usa os 9 dígitos juntos.
+    """
+    if caceal is None:
+        return None
+    numero = re.sub(r"\D", "", str(caceal))
+    if not numero:
+        return None
+    if digito is None:
+        return numero
+    return numero + re.sub(r"\D", "", str(digito))
+
+
 # --------------------------------------------------------------------------------------
 # Regra de negócio
 # --------------------------------------------------------------------------------------
-
-def _inscricoes_al(dados):
-    """Filtra as inscrições estaduais de AL do payload da cnpj.ws.
-
-    Inscrições de outros estados são ignoradas de propósito: a regra só olha AL.
-    """
-    est = dados.get("estabelecimento") or {}
-    return [
-        item
-        for item in (est.get("inscricoes_estaduais") or [])
-        if ((item.get("estado") or {}).get("sigla") or "").upper() == UF_ALVO
-    ]
-
 
 def avaliar_cnpj(cnpj):
     """Aplica a regra de `active` a um CNPJ já validado (14 dígitos).
 
     Regra:
-    1. `situacao_cadastral` na Receita precisa ser "Ativa" — se não for, reprova na hora
-       e nem consulta a SEFAZ.
-    2. Filtra as inscrições estaduais de AL (as de outros estados são ignoradas).
-       - Nenhuma IE em AL (isento): aprova só pela situação cadastral.
-       - Pelo menos uma IE com `ativo = true`: aprova.
-       - Nenhuma ativa: consulta cada IE na SEFAZ/AL. Basta UMA "INAPTO" para reprovar
-         (e aí para de consultar as demais).
+    1. `situacao_cadastral` na Receita (cnpj.ws) precisa ser "Ativa" — se não for,
+       reprova na hora e nem consulta a SEFAZ.
+    2. Busca as inscrições estaduais do CNPJ na SEFAZ/AL:
+       - Nenhuma inscrição (isento, de fora do estado, ou só cadastro de pessoa sem
+         CACEAL): aprova pela situação cadastral.
+       - Pelo menos uma com `situacaoCadastralContribuinte = ATIVO`: aprova. As demais
+         (BAIXA, INAPTO...) não atrapalham — são inscrições históricas do mesmo CNPJ.
+       - Nenhuma ATIVO: reprova, dizendo a situação de cada uma. Se alguma veio sem
+         situação informada, fica indefinido (None) em vez de reprovar.
 
     Devolve o dict de resposta. `active` é None quando não deu para decidir (fonte
     externa fora do ar), para não reprovar um cliente bom por indisponibilidade.
@@ -272,59 +310,56 @@ def avaliar_cnpj(cnpj):
         )
         return resultado
 
-    # 2. Inscrições estaduais de AL.
-    inscricoes = _inscricoes_al(dados)
+    # 2. Inscrições estaduais, direto da SEFAZ/AL pelo CNPJ.
+    contribuintes, erro_sefaz = consultar_sefaz_al(cnpj)
+    if erro_sefaz:
+        resultado["active"] = None
+        resultado["motivo"] = f"Não foi possível consultar a SEFAZ/AL: {erro_sefaz}"
+        return resultado
+
+    # Itens sem CACEAL são cadastro de pessoa sem inscrição estadual: a SEFAZ devolve o
+    # CNPJ com endereço em AL, `numeroCaceal: null` e `situacaoCadastralContribuinte:
+    # null`, só com o `situacaoCadastralPj`. Não são IE e não entram na regra.
     resultado["inscricoesEstaduaisAl"] = [
-        {"inscricaoEstadual": i.get("inscricao_estadual"), "ativo": bool(i.get("ativo"))}
-        for i in inscricoes
+        ie
+        for ie in (_normalizar_contribuinte(i) for i in contribuintes)
+        if ie["numeroCaceal"]
     ]
 
-    if not inscricoes:
+    if not resultado["inscricoesEstaduaisAl"]:
         resultado["active"] = True
-        resultado["motivo"] = "Sem inscrição estadual em AL (isento); situação cadastral Ativa"
+        resultado["motivo"] = (
+            f"Sem inscrição estadual em {UF_ALVO} (isento); situação cadastral Ativa"
+        )
         return resultado
 
-    ativas = [i for i in inscricoes if i.get("ativo")]
+    ativas = [i for i in resultado["inscricoesEstaduaisAl"] if i["ativo"]]
     if ativas:
-        numeros = ", ".join(str(i.get("inscricao_estadual")) for i in ativas)
+        numeros = ", ".join(str(i["inscricaoEstadual"]) for i in ativas)
         resultado["active"] = True
-        resultado["motivo"] = f"Situação cadastral Ativa e IE ativa em AL ({numeros})"
+        resultado["motivo"] = (
+            f"Situação cadastral Ativa e IE ativa na SEFAZ/{UF_ALVO} ({numeros})"
+        )
         return resultado
 
-    # Nenhuma IE ativa na cnpj.ws: a SEFAZ dá a palavra final, uma a uma.
-    indeterminadas = []
-    for item in resultado["inscricoesEstaduaisAl"]:
-        info, erro_sefaz = consultar_sefaz_al(item["inscricaoEstadual"])
-        if erro_sefaz:
-            item["sefaz"] = {"erro": erro_sefaz}
-            indeterminadas.append(f"{item['inscricaoEstadual']} ({erro_sefaz})")
-            continue
-
-        item["sefaz"] = info
-        if (info.get("situacaoCadastral") or "").strip().upper() == _SITUACAO_SEFAZ_REPROVADA:
-            # Uma INAPTO já reprova — não consulta as demais.
-            motivo_ie = info.get("motivo")
-            resultado["active"] = False
-            resultado["motivo"] = (
-                f"IE {item['inscricaoEstadual']} (AL) está INAPTO na SEFAZ"
-                + (f" - {motivo_ie.strip()}" if motivo_ie else "")
-            )
-            return resultado
-
-    if indeterminadas:
+    # IE com CACEAL mas sem situação: a SEFAZ não informou o dado. Reprovar por ausência
+    # de informação seria tratar falha de cadastro como irregularidade — fica indefinido.
+    sem_situacao = [i for i in resultado["inscricoesEstaduaisAl"] if not i["situacaoCadastral"]]
+    if sem_situacao:
+        numeros = ", ".join(str(i["inscricaoEstadual"]) for i in sem_situacao)
         resultado["active"] = None
         resultado["motivo"] = (
-            "Não foi possível confirmar a situação na SEFAZ/AL de: "
-            + "; ".join(indeterminadas)
+            f"SEFAZ/{UF_ALVO} não informou a situação da(s) inscrição(ões) {numeros}"
         )
         return resultado
 
     situacoes = ", ".join(
-        f"{i['inscricaoEstadual']}={(i.get('sefaz') or {}).get('situacaoCadastral')}"
+        f"{i['inscricaoEstadual']}={i['situacaoCadastral']}"
+        + (f" ({i['motivo'].strip()})" if i.get("motivo") else "")
         for i in resultado["inscricoesEstaduaisAl"]
     )
-    resultado["active"] = True
-    resultado["motivo"] = f"Situação cadastral Ativa e nenhuma IE de AL INAPTO na SEFAZ ({situacoes})"
+    resultado["active"] = False
+    resultado["motivo"] = f"Nenhuma IE de {UF_ALVO} ativa na SEFAZ ({situacoes})"
     return resultado
 
 
