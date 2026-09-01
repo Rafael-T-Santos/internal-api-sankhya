@@ -603,8 +603,8 @@ Decide se um CNPJ está **apto a operar em Alagoas** (`active`), cruzando a Rece
 2. Busca as inscrições estaduais **direto na SEFAZ/AL pelo CNPJ** — um CNPJ pode ter vários CACEAIs (o atual e os históricos):
    - **Nenhuma inscrição** (isento, empresa de fora do estado, ou só cadastro de pessoa sem CACEAL) → aprova só pela situação cadastral.
    - **Pelo menos uma com `situacaoCadastralContribuinte = ATIVO`** → aprova. As outras (`BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) **não atrapalham** — são inscrições antigas do mesmo CNPJ.
-   - **Uma única inscrição e ela está `BAIXA`** → aprova. O contribuinte encerrou a IE por deixar de ser obrigado a ela (ex.: `ESTABELECIMENTO NAO OBRIGADO`) e segue regular na Receita — não tem inscrição irregular alguma.
-   - **Nenhuma `ATIVO` nos demais casos** (duas ou mais inscrições sem nenhuma ativa, ou uma única `INAPTO`/`DESENQUADRAMENTO`) → reprova, e o `motivo` lista a situação de cada uma.
+   - **Todas encerradas** (`BAIXA` ou `DESENQUADRAMENTO`), quantas forem → aprova. O contribuinte deixou de precisar da IE — encerrou por não ser mais obrigado a ela (`ESTABELECIMENTO NAO OBRIGADO`) ou saiu do regime que a exigia — e segue regular na Receita. Não há inscrição irregular alguma.
+   - **Nenhuma `ATIVO` nos demais casos** → reprova, e o `motivo` lista a situação de cada uma. Na prática é ter alguma `INAPTO`: ali a SEFAZ **suspendeu** a inscrição (omissão de declaração, por exemplo), o contribuinte não a encerrou — e uma só basta para reprovar, mesmo que as outras estejam encerradas.
    - **Alguma inscrição sem situação informada** (CACEAL preenchido, `situacaoCadastralContribuinte` nulo) → `active: null`. Dado que a SEFAZ não informou não vira reprovação.
 
 > **As inscrições estaduais da cnpj.ws não são usadas.** A flag `ativo` de lá se mostrou não confiável (desatualizada em relação ao cadastro do estado) — da cnpj.ws vêm só a situação na Receita e os dados de identificação. Quem manda sobre IE de AL é a SEFAZ.
@@ -627,7 +627,7 @@ Fontes consultadas:
 ```
 
 ```jsonc
-// 200 — registro único
+// 200 — registro único. Reprova pela `INAPTO`: a `DESENQUADRAMENTO` sozinha aprovaria
 {
   "sucesso": true,
   "cnpj": "12014916000180",
@@ -666,12 +666,12 @@ Fontes consultadas:
   ]
 }
 
-// 200 — CNPJ com uma única IE, baixada: aprova (encerrou a IE por não ser mais obrigado)
+// 200 — CNPJ com as IEs todas encerradas: aprova (deixou de precisar da inscrição)
 {
   "sucesso": true,
   "cnpj": "58391811000140",
   "active": true,
-  "motivo": "Situação cadastral Ativa e única IE de AL baixada (241402506 — ESTABELECIMENTO NAO OBRIGADO)",
+  "motivo": "Situação cadastral Ativa e IE de AL encerrada (241402506=BAIXA (ESTABELECIMENTO NAO OBRIGADO))",
   "razaoSocial": "E F GONCALVES LTDA",
   "nomeFantasia": "GONCALVES CONSTRUCOES",
   "situacaoCadastral": "Ativa",
@@ -707,7 +707,7 @@ Fontes consultadas:
 |---|---|
 | `inscricaoEstadual` | `numeroCaceal` + `digitoCaceal` (9 dígitos) |
 | `numeroCaceal` | `numeroCaceal` (8 dígitos, sem o DV) |
-| `ativo` | `true` só quando `situacaoCadastralContribuinte` é `ATIVO`. É a situação **daquela inscrição**, não o veredito do CNPJ — uma única IE `BAIXA` sai com `ativo: false` e mesmo assim o CNPJ fica `active: true` |
+| `ativo` | `true` só quando `situacaoCadastralContribuinte` é `ATIVO`. É a situação **daquela inscrição**, não o veredito do CNPJ — um CNPJ com todas as IEs `BAIXA`/`DESENQUADRAMENTO` sai com `ativo: false` em todas e mesmo assim fica `active: true` |
 | `situacaoCadastral` | `situacaoCadastralContribuinte` (`ATIVO`, `BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) |
 | `motivo` | `descricaoMotivoSituacaoCadastral` |
 | `dataAlteracao` | `dataAlteracaoSituacaoCastral` (o nome com erro de digitação é da SEFAZ) |
