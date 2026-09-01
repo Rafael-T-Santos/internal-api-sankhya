@@ -603,7 +603,8 @@ Decide se um CNPJ está **apto a operar em Alagoas** (`active`), cruzando a Rece
 2. Busca as inscrições estaduais **direto na SEFAZ/AL pelo CNPJ** — um CNPJ pode ter vários CACEAIs (o atual e os históricos):
    - **Nenhuma inscrição** (isento, empresa de fora do estado, ou só cadastro de pessoa sem CACEAL) → aprova só pela situação cadastral.
    - **Pelo menos uma com `situacaoCadastralContribuinte = ATIVO`** → aprova. As outras (`BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) **não atrapalham** — são inscrições antigas do mesmo CNPJ.
-   - **Nenhuma `ATIVO`** → reprova, e o `motivo` lista a situação de cada uma.
+   - **Uma única inscrição e ela está `BAIXA`** → aprova. O contribuinte encerrou a IE por deixar de ser obrigado a ela (ex.: `ESTABELECIMENTO NAO OBRIGADO`) e segue regular na Receita — não tem inscrição irregular alguma.
+   - **Nenhuma `ATIVO` nos demais casos** (duas ou mais inscrições sem nenhuma ativa, ou uma única `INAPTO`/`DESENQUADRAMENTO`) → reprova, e o `motivo` lista a situação de cada uma.
    - **Alguma inscrição sem situação informada** (CACEAL preenchido, `situacaoCadastralContribuinte` nulo) → `active: null`. Dado que a SEFAZ não informou não vira reprovação.
 
 > **As inscrições estaduais da cnpj.ws não são usadas.** A flag `ativo` de lá se mostrou não confiável (desatualizada em relação ao cadastro do estado) — da cnpj.ws vêm só a situação na Receita e os dados de identificação. Quem manda sobre IE de AL é a SEFAZ.
@@ -665,6 +666,23 @@ Fontes consultadas:
   ]
 }
 
+// 200 — CNPJ com uma única IE, baixada: aprova (encerrou a IE por não ser mais obrigado)
+{
+  "sucesso": true,
+  "cnpj": "58391811000140",
+  "active": true,
+  "motivo": "Situação cadastral Ativa e única IE de AL baixada (241402506 — ESTABELECIMENTO NAO OBRIGADO)",
+  "razaoSocial": "E F GONCALVES LTDA",
+  "nomeFantasia": "GONCALVES CONSTRUCOES",
+  "situacaoCadastral": "Ativa",
+  "uf": "AL",
+  "inscricoesEstaduaisAl": [
+    { "inscricaoEstadual": "241402506", "numeroCaceal": "24140250", "ativo": false,
+      "situacaoCadastral": "BAIXA", "motivo": "ESTABELECIMENTO NAO OBRIGADO",
+      "dataAlteracao": "2025-03-07 08:27:57.0" }
+  ]
+}
+
 // 200 — lote (um objeto por CNPJ, no mesmo formato acima)
 { "sucesso": true, "totalRegistros": 2, "dados": [ { ... }, { ... } ] }
 
@@ -689,7 +707,7 @@ Fontes consultadas:
 |---|---|
 | `inscricaoEstadual` | `numeroCaceal` + `digitoCaceal` (9 dígitos) |
 | `numeroCaceal` | `numeroCaceal` (8 dígitos, sem o DV) |
-| `ativo` | `true` só quando `situacaoCadastralContribuinte` é `ATIVO` |
+| `ativo` | `true` só quando `situacaoCadastralContribuinte` é `ATIVO`. É a situação **daquela inscrição**, não o veredito do CNPJ — uma única IE `BAIXA` sai com `ativo: false` e mesmo assim o CNPJ fica `active: true` |
 | `situacaoCadastral` | `situacaoCadastralContribuinte` (`ATIVO`, `BAIXA`, `INAPTO`, `DESENQUADRAMENTO`...) |
 | `motivo` | `descricaoMotivoSituacaoCadastral` |
 | `dataAlteracao` | `dataAlteracaoSituacaoCastral` (o nome com erro de digitação é da SEFAZ) |

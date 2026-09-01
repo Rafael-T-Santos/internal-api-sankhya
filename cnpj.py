@@ -54,6 +54,12 @@ _SITUACAO_APROVADA = "ativa"
 # reprovam se houver outra IE ATIVO — costumam ser inscrições históricas do mesmo CNPJ.
 _SITUACAO_SEFAZ_ATIVA = "ATIVO"
 
+# Baixa da inscrição estadual. Quando é a única inscrição do CNPJ, não reprova: é o caso
+# do contribuinte que encerrou a IE por não ser mais obrigado a ela (ex.: prestador de
+# serviço, "ESTABELECIMENTO NAO OBRIGADO") e segue regular na Receita. Duas ou mais
+# inscrições, todas baixadas, continuam reprovando — aí a empresa perdeu a IE que tinha.
+_SITUACAO_SEFAZ_BAIXA = "BAIXA"
+
 # Paginação do endpoint de lista da SEFAZ (a URL termina em /{pagina}/{tamanho}).
 _SEFAZ_TAMANHO_PAGINA = 50
 
@@ -270,8 +276,10 @@ def avaliar_cnpj(cnpj):
          CACEAL): aprova pela situação cadastral.
        - Pelo menos uma com `situacaoCadastralContribuinte = ATIVO`: aprova. As demais
          (BAIXA, INAPTO...) não atrapalham — são inscrições históricas do mesmo CNPJ.
-       - Nenhuma ATIVO: reprova, dizendo a situação de cada uma. Se alguma veio sem
-         situação informada, fica indefinido (None) em vez de reprovar.
+       - Uma única inscrição e ela está BAIXA: aprova. O contribuinte encerrou a IE por
+         não ser mais obrigado a ela e segue regular na Receita.
+       - Nenhuma ATIVO nos demais casos: reprova, dizendo a situação de cada uma. Se
+         alguma veio sem situação informada, fica indefinido (None) em vez de reprovar.
 
     Devolve o dict de resposta. `active` é None quando não deu para decidir (fonte
     externa fora do ar), para não reprovar um cliente bom por indisponibilidade.
@@ -350,6 +358,22 @@ def avaliar_cnpj(cnpj):
         resultado["active"] = None
         resultado["motivo"] = (
             f"SEFAZ/{UF_ALVO} não informou a situação da(s) inscrição(ões) {numeros}"
+        )
+        return resultado
+
+    # Uma única inscrição, baixada: aprova. É o CNPJ que teve IE e a encerrou por deixar
+    # de ser obrigado a ela — segue regular na Receita e não tem inscrição irregular
+    # alguma. Com duas ou mais inscrições, todas sem ATIVO, a leitura é outra (a empresa
+    # operava com IE e não tem mais nenhuma válida) e continua reprovando abaixo.
+    unica = resultado["inscricoesEstaduaisAl"][0] if len(resultado["inscricoesEstaduaisAl"]) == 1 else None
+    if unica and (unica["situacaoCadastral"] or "").strip().upper() == _SITUACAO_SEFAZ_BAIXA:
+        motivo_baixa = (unica.get("motivo") or "").strip()
+        resultado["active"] = True
+        resultado["motivo"] = (
+            f"Situação cadastral Ativa e única IE de {UF_ALVO} baixada "
+            f"({unica['inscricaoEstadual']}"
+            + (f" — {motivo_baixa}" if motivo_baixa else "")
+            + ")"
         )
         return resultado
 
