@@ -1089,6 +1089,45 @@ Não existe `SEM_CONTATO`: por construção todo cliente aqui já foi trabalhado
 
 Nos valores só entram títulos **vencidos** (`ATRASO_DIAS > 0`). O `/receitas-vencidas` devolve também os que ainda vão vencer — de propósito, porque aquela tela usa os filtros de data para recortar o período.
 
+### Cobrança — visão 360° por vendedor
+
+Duas leituras da **mesma** carteira vencida, agrupada de dois jeitos. Plano: `dashboard-cobranca/docs/VENDEDOR-360.md`.
+
+Diferença de fundo para o painel: aqui a base é a **carteira** e as chamadas entram por `LEFT JOIN` — o oposto do painel, e de propósito. Mostrar quem está **fora do radar** da cobrança é o motivo destas rotas existirem.
+
+⚠️ O vendedor sai do **título** (`FIN.CODVEND`), não do cadastro do cliente. Cliente que comprou com dois vendedores aparece nos dois, cada um somando só os títulos dele — então o total de um cliente aqui pode ser **menor** que o da Visão 360° dele, que mostra tudo. É a mesma leitura do filtro de vendedor do `/receitas-vencidas`.
+
+#### `GET /api/cobranca/vendedores-resumo`
+
+Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linha "SEM VENDEDOR": título sem vendedor no financeiro — dívida real, só sem dono.
+
+```jsonc
+{ "sucesso": true, "totalRegistros": 18, "dados": [
+  { "codVend": 12, "apelido": "MARCOS", "qtdClientes": 47, "qtdClientesTrabalhados": 9,
+    "qtdTitulos": 152, "valorTotal": 284310.77, "maiorAtrasoDias": 812,
+    "aging": { "d1a30":    { "qtd": 21, "valor": 44120.10 },
+               "d31a90":   { "qtd": 30, "valor": 61200.00 },
+               "d91a180":  { "qtd": 18, "valor": 38990.55 },
+               "d181a365": { "qtd": 25, "valor": 52000.12 },
+               "dMais365": { "qtd": 58, "valor": 88000.00 } } } ] }
+```
+
+#### `GET /api/cobranca/vendedor-360?codVend=12`
+
+`codVend` é **obrigatório** (400 sem ele). Uma linha por cliente daquele vendedor — os mesmos campos do `/painel`, mais `aging` por cliente. O bloco `vendedor` traz os totais, somados das mesmas linhas de `dados`: assim o cabeçalho e o gráfico da tela nunca discordam da lista.
+
+```jsonc
+{ "sucesso": true, "totalRegistros": 47,
+  "vendedor": { "codVend": 12, "apelido": "MARCOS", "qtdClientes": 47, "qtdTitulos": 152,
+                "valorTotal": 284310.77, "maiorAtrasoDias": 812, "aging": { } },
+  "dados": [ { "codParc": 3097, "nomeParc": "CARVALHO E NASCIMENTO", "situacao": "SEM_CONTATO",
+               "aging": { } } ] }
+```
+
+Aqui `situacao` **inclui `SEM_CONTATO`** — cliente com dívida e nenhuma chamada (nem finalizada nem em andamento; `CANCELADA` não conta, chamada aberta e fechada sem registrar não é contato). No painel esse estado não existe, porque lá todo cliente já foi trabalhado por construção.
+
+As faixas do `aging` são as mesmas nas duas rotas (`<= 30`, `31-90`, `91-180`, `181-365`, `> 365` dias) e ficam escritas uma vez só no SQL: réguas diferentes fariam os dois gráficos discordarem sobre a mesma dívida.
+
 ---
 
 ## Testes

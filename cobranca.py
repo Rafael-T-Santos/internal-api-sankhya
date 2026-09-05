@@ -455,7 +455,13 @@ SELECT
     FIN.NOMEEMITENTE_CMC7,
     FIN.RECDESP,
     FIN.CODTIPOPER,
-    TOP.DESCROPER
+    TOP.DESCROPER,
+    /* Coluna NOVA, no FIM da lista de propósito: o /receitas-vencidas lê o
+       resultado POSICIONALMENTE (row[0]..row[38]), e coluna acrescentada no meio
+       deslocaria todas as seguintes. Existe para a Visão 360° por Vendedor poder
+       AGRUPAR por vendedor — o APELIDO acima é só rótulo e não tem alias, então
+       não serve como chave. Ver docs/VENDEDOR-360.md §3. */
+    FIN.CODVEND
 {JOINS_TITULO}
 WHERE FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
@@ -2329,7 +2335,19 @@ def regua():
 # em aberto, vencido ou não (o filtro de vencimento está comentado lá de
 # propósito: a tela de títulos usa os filtros de data para recortar). Aqui só
 # interessa o que já venceu.
-SQL_PAINEL_ENVELOPE = """
+#
+# --- Por que estas CTEs estão fatiadas em constantes -------------------------
+# O painel da gerência e a Visão 360° por Vendedor (docs/VENDEDOR-360.md) fazem a
+# MESMA leitura por cliente, mudando só a BASE: o painel parte de quem já foi
+# trabalhado (carteira entra por LEFT JOIN); a tela do vendedor parte da carteira
+# dele (as chamadas é que entram por LEFT JOIN). Tudo o mais — a regra do valor
+# do título, a régua, o marcador de pagamento, a agenda, a trava — é idêntico.
+# Duplicar esse SQL seria repetir, dentro de casa, o erro que a REGRA DE OURO
+# proíbe com o SELECT_RECEITAS: duas cópias da mesma regra divergem na primeira
+# manutenção, e aí duas telas mostram números diferentes para a mesma dívida.
+# Por isso: as partes comuns viram SQL_CTE_*, e cada tela escreve só o seu
+# POR_CLIENTE e o seu SELECT final.
+SQL_CTE_CARTEIRA = """
 , TRABALHADOS AS (
     SELECT CODPARC,
            SUM(CASE WHEN SITUACAO = 'FINALIZADA' THEN 1 ELSE 0 END) AS QTD_CHAMADAS
@@ -2338,15 +2356,19 @@ SQL_PAINEL_ENVELOPE = """
     GROUP BY CODPARC
 ),
 CARTEIRA AS (
-    SELECT CODPARC, NUFIN, ATRASO_DIAS,
+    SELECT CODPARC, NUFIN, ATRASO_DIAS, NVL(CODVEND, 0) AS CODVEND,
            CASE WHEN CODTIPTIT = 3
                 THEN NVL(VLR_CHEQUE, NVL(VLRDESDOB, VLRLIQUIDO))
                 ELSE NVL(VLRDESDOB, NVL(VLR_CHEQUE, VLRLIQUIDO))
            END AS VALOR
     FROM ( {carteira} )
     WHERE ATRASO_DIAS > 0
-      AND CODPARC IN (SELECT CODPARC FROM TRABALHADOS)
+      {escopo_carteira}
 ),
+"""
+
+# Régua e marcador de pagamento — por TÍTULO, iguais nas duas telas.
+SQL_CTE_REGUA = """
 /* Posição de cada título na régua. Mesma regra do /regua: só PROATIVA +
    FINALIZADA conta, porque chamada receptiva não empurra para o jurídico. */
 REGUA AS (
@@ -2375,6 +2397,11 @@ PAGTO_INF AS (
       AND c.SITUACAO = 'FINALIZADA'
     GROUP BY i.NUFIN
 ),
+"""
+
+# POR_CLIENTE do PAINEL: base = TRABALHADOS (quem já foi cobrado), carteira por
+# LEFT JOIN. Cliente trabalhado que quitou continua aparecendo, com dívida zero.
+_POR_CLIENTE_PAINEL = """
 POR_CLIENTE AS (
     SELECT t.CODPARC,
            t.QTD_CHAMADAS,
@@ -2402,6 +2429,12 @@ POR_CLIENTE AS (
         LEFT JOIN PAGTO_INF pi ON pi.NUFIN   = ca.NUFIN
     GROUP BY t.CODPARC, t.QTD_CHAMADAS
 ),
+"""
+
+# Último contato, agenda, retorno atrasado e trava — por CLIENTE, iguais nas duas
+# telas. Nenhuma delas olha o vendedor: uma ligação é com o cliente, não com o
+# título, então quem cobrou e quando não muda ao fatiar a carteira por vendedor.
+SQL_CTE_CONTATO = """
 ULT_CHAMADA AS (
     SELECT CODPARC, DHFIM, CODUSU FROM (
         SELECT CODPARC, DHFIM, CODUSU,
@@ -2440,6 +2473,9 @@ TRAVA AS (
     SELECT DISTINCT CODPARC FROM AD_COBRCHAMADA
     WHERE SITUACAO = 'EM_ANDAMENTO' AND DHEXPIRA > SYSDATE
 )
+"""
+
+_SELECT_PAINEL = """
 SELECT pc.CODPARC, par.NOMEPARC, par.CGC_CPF,
        pc.QTD_TITULOS, pc.VALOR_TOTAL, pc.MAIOR_ATRASO,
        pc.ESTAGIO, pc.SEM_CONTATO, pc.ORD1, pc.ORD2, pc.ORD3, pc.ULT_DESFECHO,
@@ -2464,13 +2500,34 @@ FROM POR_CLIENTE pc
 ORDER BY pc.VALOR_TOTAL DESC
 """
 
+SQL_PAINEL_ENVELOPE = (
+    SQL_CTE_CARTEIRA
+    + SQL_CTE_REGUA
+    + _POR_CLIENTE_PAINEL
+    + SQL_CTE_CONTATO
+    + _SELECT_PAINEL
+)
 
-def _situacao_cliente(qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho):
+# Escopo da CTE CARTEIRA no painel: só quem já foi trabalhado. É redundante com o
+# FROM TRABALHADOS do POR_CLIENTE, mas poda as linhas antes do JOIN.
+ESCOPO_TRABALHADOS = "AND CODPARC IN (SELECT CODPARC FROM TRABALHADOS)"
+
+
+def _situacao_cliente(
+    qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho, tem_chamada=True
+):
     """Situação EXCLUSIVA do cliente, na ordem de precedência do plano (§3).
 
-    Não existe "SEM_CONTATO" aqui: por construção, todo cliente do painel já foi
-    trabalhado. Cliente com estágio 0 é o que só teve chamada RECEPTIVA — houve
-    contato, mas a régua (que só conta proativa) não começou.
+    No PAINEL não existe "SEM_CONTATO": por construção, todo cliente que chega lá
+    já foi trabalhado (por isso `tem_chamada` é True por padrão — o painel nem
+    passa o parâmetro). Cliente com estágio 0 é o que só teve chamada RECEPTIVA —
+    houve contato, mas a régua (que só conta proativa) não começou.
+
+    Na VISÃO POR VENDEDOR o estado volta a existir e é o motivo da tela: ali a
+    base é a carteira do vendedor, então entra cliente que ninguém ligou ainda.
+    "Sem contato" = nenhuma chamada FINALIZADA nem EM ANDAMENTO (a CTE
+    TRABALHADOS ignora CANCELADA — chamada aberta e fechada sem registrar não é
+    contato). Ver docs/VENDEDOR-360.md §2.
 
     "Elegível ao jurídico" NÃO entra: é sinalizador à parte. Um cliente pode
     estar agendado E na 3ª chamada ao mesmo tempo, e transformar isso numa
@@ -2478,6 +2535,8 @@ def _situacao_cliente(qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho):
     """
     if qtd_titulos == 0:
         return "SEM_DIVIDA"
+    if not tem_chamada:
+        return "SEM_CONTATO"
     if agenda_vencida:
         return "RETORNO_ATRASADO"
     if prox_retorno:
@@ -2485,6 +2544,54 @@ def _situacao_cliente(qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho):
     if ult_desfecho == "ACORDO":
         return "ACORDO"
     return "EM_ANDAMENTO"
+
+
+def _linha_cliente(r, tem_chamada=True):
+    """Linha "um cliente" → dicionário, das colunas 0..20 do SELECT.
+
+    Painel e Visão por Vendedor devolvem exatamente os mesmos 21 primeiros campos
+    (é o mesmo cartão de cliente na tela, com outro conjunto de clientes), então
+    a montagem fica num lugar só. Cada rota acrescenta os campos próprios dela
+    depois — as colunas EXTRA vêm no fim do SELECT, justamente para não deslocar
+    os índices lidos aqui.
+    """
+    qtd_titulos = int(r[3] or 0)
+    estagio = int(r[6] or 0)
+    ult_desfecho = _txt(r[11])
+    prox_retorno = _dh(r[15])
+    agenda_vencida = _dh(r[17])
+    return {
+        "codParc": int(r[0]),
+        "nomeParc": _txt(r[1]),
+        # Cru, como no /cobranca/cliente — quem formata é o fmtDoc do app.
+        "cgcCpf": _txt(r[2]),
+        "qtdTitulos": qtd_titulos,
+        "valorTotal": float(r[4] or 0),
+        "maiorAtrasoDias": int(r[5] or 0),
+        "estagio": estagio,
+        "titulosSemContato": int(r[7] or 0),
+        "porOrdem": {"1": int(r[8] or 0), "2": int(r[9] or 0), "3": int(r[10] or 0)},
+        "ultimoDesfecho": ult_desfecho,
+        "qtdChamadas": int(r[12] or 0),
+        "ultimoContatoEm": _dh(r[13]),
+        "ultimoContatoPor": _txt(r[14]),
+        "proximoRetornoEm": prox_retorno,
+        "proximoRetornoPor": _txt(r[16]),
+        "retornoAtrasadoDe": agenda_vencida,
+        "emChamadaAgora": bool(r[18]),
+        # SINALIZADOR, não situação: o cliente pode ter informado pagamento E
+        # estar com retorno atrasado ao mesmo tempo, e virar situação exclusiva
+        # esconderia um dos dois — mesmo motivo do podeJuridico
+        # (docs/PAINEL-GERENTE.md §3).
+        "titulosPagamentoInformado": int(r[19] or 0),
+        "pagamentoInformadoEm": _dh(r[20]),
+        "situacao": _situacao_cliente(
+            qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho, tem_chamada
+        ),
+        # Elegibilidade, NÃO encaminhamento: não existe Fase 4 no sistema.
+        # Ver docs/PAINEL-GERENTE.md §2.
+        "podeJuridico": estagio >= 3 and ult_desfecho != "ACORDO",
+    }
 
 
 @bp.route("/api/cobranca/painel", methods=["GET"])
@@ -2505,7 +2612,9 @@ def painel():
             filtros.append(f"AND {coluna} = :{campo.upper()}")
 
     carteira = SELECT_RECEITAS + "\n" + "\n".join(filtros)
-    sql = CTE_CHEQUES + SQL_PAINEL_ENVELOPE.format(carteira=carteira)
+    sql = CTE_CHEQUES + SQL_PAINEL_ENVELOPE.format(
+        carteira=carteira, escopo_carteira=ESCOPO_TRABALHADOS
+    )
 
     conexao = None
     try:
@@ -2516,49 +2625,279 @@ def painel():
         cursor = conexao.cursor()
         cursor.execute(sql, params)
 
-        dados = []
-        for r in cursor.fetchall():
-            qtd_titulos = int(r[3] or 0)
-            estagio = int(r[6] or 0)
-            ult_desfecho = _txt(r[11])
-            prox_retorno = _dh(r[15])
-            agenda_vencida = _dh(r[17])
-            dados.append(
-                {
-                    "codParc": int(r[0]),
-                    "nomeParc": _txt(r[1]),
-                    # Cru, como no /cobranca/cliente — quem formata é o fmtDoc do app.
-                    "cgcCpf": _txt(r[2]),
-                    "qtdTitulos": qtd_titulos,
-                    "valorTotal": float(r[4] or 0),
-                    "maiorAtrasoDias": int(r[5] or 0),
-                    "estagio": estagio,
-                    "titulosSemContato": int(r[7] or 0),
-                    "porOrdem": {"1": int(r[8] or 0), "2": int(r[9] or 0), "3": int(r[10] or 0)},
-                    "ultimoDesfecho": ult_desfecho,
-                    "qtdChamadas": int(r[12] or 0),
-                    "ultimoContatoEm": _dh(r[13]),
-                    "ultimoContatoPor": _txt(r[14]),
-                    "proximoRetornoEm": prox_retorno,
-                    "proximoRetornoPor": _txt(r[16]),
-                    "retornoAtrasadoDe": agenda_vencida,
-                    "emChamadaAgora": bool(r[18]),
-                    # SINALIZADOR, não situação: o cliente pode ter informado
-                    # pagamento E estar com retorno atrasado ao mesmo tempo, e
-                    # virar situação exclusiva esconderia um dos dois — mesmo
-                    # motivo do podeJuridico (docs/PAINEL-GERENTE.md §3).
-                    "titulosPagamentoInformado": int(r[19] or 0),
-                    "pagamentoInformadoEm": _dh(r[20]),
-                    "situacao": _situacao_cliente(
-                        qtd_titulos, agenda_vencida, prox_retorno, ult_desfecho
-                    ),
-                    # Elegibilidade, NÃO encaminhamento: não existe Fase 4 no
-                    # sistema. Ver docs/PAINEL-GERENTE.md §2.
-                    "podeJuridico": estagio >= 3 and ult_desfecho != "ACORDO",
-                }
-            )
+        dados = [_linha_cliente(r) for r in cursor.fetchall()]
 
         return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+# --- Visão 360° por Vendedor --------------------------------------------------
+#
+# Duas leituras da MESMA carteira (docs/VENDEDOR-360.md):
+#   /vendedores-resumo  → uma linha por vendedor  (tela de entrada)
+#   /vendedor-360       → uma linha por cliente DAQUELE vendedor (detalhe)
+#
+# Diferença de fundo para o painel da gerência: aqui a base é a CARTEIRA, e as
+# chamadas entram por LEFT JOIN. É o oposto do painel, e de propósito — mostrar
+# quem está FORA do radar da cobrança é o motivo desta tela existir.
+#
+# ⚠️ O vendedor sai do TÍTULO (FIN.CODVEND), não do cadastro do cliente
+# (PAR.CODVEND). Um cliente que comprou com dois vendedores aparece nas duas
+# telas, cada uma somando só os títulos dela — por isso o total do cliente aqui
+# pode ser MENOR que o da Visão 360° dele, que mostra tudo. É a leitura certa
+# para "títulos por vendedor" e a mesma que o filtro de vendedor da tela de
+# Títulos Vencidos já usa.
+
+# Faixas de atraso (aging). As 5 são as mesmas medidas com a carteira real em
+# 08/08 e ficam escritas UMA vez: se a tela de entrada e a de detalhe usassem
+# réguas diferentes, os dois gráficos discordariam sobre a mesma dívida.
+# Ordem: as 5 contagens e DEPOIS os 5 valores (o _aging lê por deslocamento).
+SQL_AGING = """
+           SUM(CASE WHEN ca.ATRASO_DIAS <= 30                THEN 1 ELSE 0 END) AS QTD_F1,
+           SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 31  AND 90   THEN 1 ELSE 0 END) AS QTD_F2,
+           SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 91  AND 180  THEN 1 ELSE 0 END) AS QTD_F3,
+           SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 181 AND 365  THEN 1 ELSE 0 END) AS QTD_F4,
+           SUM(CASE WHEN ca.ATRASO_DIAS > 365                THEN 1 ELSE 0 END) AS QTD_F5,
+           NVL(SUM(CASE WHEN ca.ATRASO_DIAS <= 30               THEN ca.VALOR END), 0) AS VLR_F1,
+           NVL(SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 31  AND 90  THEN ca.VALOR END), 0) AS VLR_F2,
+           NVL(SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 91  AND 180 THEN ca.VALOR END), 0) AS VLR_F3,
+           NVL(SUM(CASE WHEN ca.ATRASO_DIAS BETWEEN 181 AND 365 THEN ca.VALOR END), 0) AS VLR_F4,
+           NVL(SUM(CASE WHEN ca.ATRASO_DIAS > 365               THEN ca.VALOR END), 0) AS VLR_F5
+"""
+
+# Chaves das faixas na resposta JSON, na MESMA ordem das colunas do SQL_AGING.
+FAIXAS_ATRASO = ("d1a30", "d31a90", "d91a180", "d181a365", "dMais365")
+
+
+def _aging(r, base):
+    """As 5 faixas a partir de 10 colunas consecutivas (5 contagens, 5 valores)."""
+    return {
+        chave: {"qtd": int(r[base + i] or 0), "valor": float(r[base + 5 + i] or 0)}
+        for i, chave in enumerate(FAIXAS_ATRASO)
+    }
+
+
+# POR_CLIENTE do VENDEDOR: base = CARTEIRA (todo cliente com título vencido dele),
+# chamadas por LEFT JOIN. Cliente sem nenhuma chamada entra com TEM_CHAMADA = 0 e
+# vira "sem contato" — é justamente quem a tela quer revelar.
+_POR_CLIENTE_VENDEDOR = """
+POR_CLIENTE AS (
+    SELECT ca.CODPARC,
+           NVL(t.QTD_CHAMADAS, 0) AS QTD_CHAMADAS,
+           COUNT(ca.NUFIN)             AS QTD_TITULOS,
+           NVL(SUM(ca.VALOR), 0)       AS VALOR_TOTAL,
+           NVL(MAX(ca.ATRASO_DIAS), 0) AS MAIOR_ATRASO,
+           NVL(MAX(r.ORDEM), 0)        AS ESTAGIO,
+           /* Aqui a CARTEIRA é a base, então ca.NUFIN nunca é nulo: título sem
+              linha na régua é título que nunca entrou numa chamada. */
+           SUM(CASE WHEN r.NUFIN IS NULL THEN 1 ELSE 0 END) AS SEM_CONTATO,
+           SUM(CASE WHEN r.ORDEM  = 1 THEN 1 ELSE 0 END) AS ORD1,
+           SUM(CASE WHEN r.ORDEM  = 2 THEN 1 ELSE 0 END) AS ORD2,
+           SUM(CASE WHEN r.ORDEM >= 3 THEN 1 ELSE 0 END) AS ORD3,
+           MAX(r.DESFECHO) KEEP (
+               DENSE_RANK LAST ORDER BY NVL(r.ORDEM, 0), r.DHULTIMA
+           ) AS ULT_DESFECHO,
+           COUNT(pi.NUFIN)     AS QTD_PAGTO_INF,
+           MAX(pi.DHINFORMADO) AS DH_PAGTO_INF,
+           CASE WHEN t.CODPARC IS NULL THEN 0 ELSE 1 END AS TEM_CHAMADA,
+""" + SQL_AGING + """
+    FROM CARTEIRA ca
+        LEFT JOIN TRABALHADOS t  ON t.CODPARC  = ca.CODPARC
+        LEFT JOIN REGUA       r  ON r.NUFIN    = ca.NUFIN
+        LEFT JOIN PAGTO_INF   pi ON pi.NUFIN   = ca.NUFIN
+    GROUP BY ca.CODPARC, t.CODPARC, t.QTD_CHAMADAS
+),
+"""
+
+# As colunas 0..20 são as MESMAS do painel, na mesma ordem — é o que permite os
+# dois usarem o _linha_cliente. As novas (21 em diante) vêm depois, no fim.
+_SELECT_VENDEDOR = """
+SELECT pc.CODPARC, par.NOMEPARC, par.CGC_CPF,
+       pc.QTD_TITULOS, pc.VALOR_TOTAL, pc.MAIOR_ATRASO,
+       pc.ESTAGIO, pc.SEM_CONTATO, pc.ORD1, pc.ORD2, pc.ORD3, pc.ULT_DESFECHO,
+       pc.QTD_CHAMADAS,
+       uc.DHFIM   AS ULTIMO_CONTATO,
+       uu.NOMEUSU AS ULTIMO_POR,
+       ag.PROX_RETORNO,
+       au.NOMEUSU AS PROX_POR,
+       atr.AGENDA_VENCIDA,
+       CASE WHEN tv.CODPARC IS NULL THEN 0 ELSE 1 END AS EM_CHAMADA,
+       pc.QTD_PAGTO_INF, pc.DH_PAGTO_INF,
+       pc.TEM_CHAMADA,
+       pc.QTD_F1, pc.QTD_F2, pc.QTD_F3, pc.QTD_F4, pc.QTD_F5,
+       pc.VLR_F1, pc.VLR_F2, pc.VLR_F3, pc.VLR_F4, pc.VLR_F5
+FROM POR_CLIENTE pc
+    INNER JOIN TGFPAR par ON par.CODPARC = pc.CODPARC
+    LEFT JOIN ULT_CHAMADA uc  ON uc.CODPARC  = pc.CODPARC
+    LEFT JOIN TSIUSU      uu  ON uu.CODUSU   = uc.CODUSU
+    LEFT JOIN AGENDA      ag  ON ag.CODPARC  = pc.CODPARC
+    LEFT JOIN TSIUSU      au  ON au.CODUSU   = ag.PROX_USU
+    LEFT JOIN ATRASADO    atr ON atr.CODPARC = pc.CODPARC
+    LEFT JOIN TRAVA       tv  ON tv.CODPARC  = pc.CODPARC
+ORDER BY pc.VALOR_TOTAL DESC
+"""
+
+SQL_VENDEDOR_ENVELOPE = (
+    SQL_CTE_CARTEIRA
+    + SQL_CTE_REGUA
+    + _POR_CLIENTE_VENDEDOR
+    + SQL_CTE_CONTATO
+    + _SELECT_VENDEDOR
+)
+
+# Tela de entrada: uma linha por vendedor. Não precisa da régua nem da agenda —
+# só da carteira e de quantos clientes dela já receberam alguma chamada.
+SQL_VENDEDORES_RESUMO = SQL_CTE_CARTEIRA + """
+SELECT ca.CODVEND,
+       NVL(ven.APELIDO, 'SEM VENDEDOR') AS APELIDO,
+       COUNT(DISTINCT ca.CODPARC) AS QTD_CLIENTES,
+       /* "Trabalhado" é por CLIENTE, não por título: a chamada é com o cliente.
+          Um cliente atendido por dois vendedores conta como trabalhado nos dois,
+          porque foi mesmo. */
+       COUNT(DISTINCT CASE WHEN t.CODPARC IS NOT NULL THEN ca.CODPARC END) AS QTD_CLI_TRAB,
+       COUNT(ca.NUFIN)             AS QTD_TITULOS,
+       NVL(SUM(ca.VALOR), 0)       AS VALOR_TOTAL,
+       NVL(MAX(ca.ATRASO_DIAS), 0) AS MAIOR_ATRASO,
+""" + SQL_AGING + """
+FROM CARTEIRA ca
+    LEFT JOIN TRABALHADOS t   ON t.CODPARC   = ca.CODPARC
+    LEFT JOIN TGFVEN      ven ON ven.CODVEND = ca.CODVEND
+GROUP BY ca.CODVEND, ven.APELIDO
+ORDER BY VALOR_TOTAL DESC
+"""
+
+
+@bp.route("/api/cobranca/vendedores-resumo", methods=["GET"])
+def vendedores_resumo():
+    """Uma linha por vendedor, sobre a carteira VENCIDA — tela de entrada.
+
+    Sem filtro: são poucas dezenas de linhas e a tela precisa do ranking inteiro
+    para o gerente escolher em quem clicar.
+    """
+    sql = CTE_CHEQUES + SQL_VENDEDORES_RESUMO.format(
+        carteira=SELECT_RECEITAS, escopo_carteira=""
+    )
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+        cursor.execute(sql)
+
+        dados = [
+            {
+                # CODVEND 0 = título sem vendedor (a CTE CARTEIRA faz NVL para 0).
+                # Vira uma linha normal da lista, rotulada "SEM VENDEDOR": é
+                # dívida real, só não tem dono.
+                "codVend": int(r[0] or 0),
+                "apelido": _txt(r[1]) or "SEM VENDEDOR",
+                "qtdClientes": int(r[2] or 0),
+                "qtdClientesTrabalhados": int(r[3] or 0),
+                "qtdTitulos": int(r[4] or 0),
+                "valorTotal": float(r[5] or 0),
+                "maiorAtrasoDias": int(r[6] or 0),
+                "aging": _aging(r, 7),
+            }
+            for r in cursor.fetchall()
+        ]
+
+        return jsonify({"sucesso": True, "totalRegistros": len(dados), "dados": dados})
+
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    except Exception as e:
+        return _erro(e)
+    finally:
+        if conexao:
+            conexao.close()
+
+
+@bp.route("/api/cobranca/vendedor-360", methods=["GET"])
+def vendedor_360():
+    """Uma linha por cliente do vendedor, com a situação de cobrança de cada um.
+
+    Query: ?codVend=<int> (obrigatório).
+    """
+    valor = request.args.get("codVend")
+    if valor in (None, ""):
+        return jsonify({"erro": "Parâmetro 'codVend' é obrigatório."}), 400
+    try:
+        cod_vend = int(valor)
+    except ValueError:
+        return jsonify({"erro": "Parâmetro 'codVend' deve ser um número."}), 400
+
+    # NVL(...,0) para casar com o agrupamento do /vendedores-resumo, que junta
+    # CODVEND nulo e 0 na mesma linha "SEM VENDEDOR". Sem isso, clicar naquela
+    # linha traria menos clientes do que ela mesma diz ter.
+    carteira = SELECT_RECEITAS + "\nAND NVL(FIN.CODVEND, 0) = :CODVEND"
+    sql = CTE_CHEQUES + SQL_VENDEDOR_ENVELOPE.format(
+        carteira=carteira, escopo_carteira=""
+    )
+
+    conexao = None
+    try:
+        conexao = conectar_oracle()
+        if not conexao:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+
+        cursor = conexao.cursor()
+
+        # Consulta à parte para o nome: se o vendedor não tiver nenhum título
+        # vencido, a consulta grande volta vazia e a tela ainda precisa dizer de
+        # quem ela está falando.
+        cursor.execute(
+            "SELECT APELIDO FROM TGFVEN WHERE CODVEND = :CODVEND", {"CODVEND": cod_vend}
+        )
+        linha = cursor.fetchone()
+        apelido = (_txt(linha[0]) if linha else None) or "SEM VENDEDOR"
+
+        cursor.execute(sql, {"CODVEND": cod_vend})
+
+        dados = []
+        for r in cursor.fetchall():
+            cliente = _linha_cliente(r, tem_chamada=bool(r[21]))
+            # Por cliente para o gráfico poder filtrar a tabela: clicar numa faixa
+            # do aging mostra só quem tem título nela, sem ida nova ao servidor.
+            cliente["aging"] = _aging(r, 22)
+            dados.append(cliente)
+
+        # Totais do vendedor somados a partir das MESMAS linhas que a tabela
+        # mostra — assim o cabeçalho e o gráfico nunca discordam da lista.
+        # Não é "somar no navegador": as linhas já vêm agregadas do Oracle.
+        vendedor = {
+            "codVend": cod_vend,
+            "apelido": apelido,
+            "qtdClientes": len(dados),
+            "qtdTitulos": sum(c["qtdTitulos"] for c in dados),
+            "valorTotal": sum(c["valorTotal"] for c in dados),
+            "maiorAtrasoDias": max((c["maiorAtrasoDias"] for c in dados), default=0),
+            "aging": {
+                faixa: {
+                    "qtd": sum(c["aging"][faixa]["qtd"] for c in dados),
+                    "valor": sum(c["aging"][faixa]["valor"] for c in dados),
+                }
+                for faixa in FAIXAS_ATRASO
+            },
+        }
+
+        return jsonify(
+            {
+                "sucesso": True,
+                "totalRegistros": len(dados),
+                "vendedor": vendedor,
+                "dados": dados,
+            }
+        )
 
     except cx_Oracle.Error as err:
         return _erro(f"Erro de Banco de Dados: {err}")
