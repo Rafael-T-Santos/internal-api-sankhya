@@ -2830,22 +2830,33 @@ def vendedores_resumo():
 
 @bp.route("/api/cobranca/vendedor-360", methods=["GET"])
 def vendedor_360():
-    """Uma linha por cliente do vendedor, com a situação de cobrança de cada um.
+    """Uma linha por cliente, com a situação de cobrança de cada um.
 
-    Query: ?codVend=<int> (obrigatório).
+    Query: ?codVend=<int> (OPCIONAL). Sem ele, devolve a carteira vencida
+    INTEIRA — é o consolidado "todos os vendedores" da tela de entrada.
+
+    O consolidado precisa vir do banco, e não de somar as linhas do
+    /vendedores-resumo no navegador: quem compra com dois vendedores tem título
+    nos dois, então somar os `qtdClientes` contaria o mesmo cliente duas vezes.
+    Aqui a base é o CLIENTE, e cada um aparece uma vez só.
     """
     valor = request.args.get("codVend")
-    if valor in (None, ""):
-        return jsonify({"erro": "Parâmetro 'codVend' é obrigatório."}), 400
-    try:
-        cod_vend = int(valor)
-    except ValueError:
-        return jsonify({"erro": "Parâmetro 'codVend' deve ser um número."}), 400
+    cod_vend = None
+    if valor not in (None, ""):
+        try:
+            cod_vend = int(valor)
+        except ValueError:
+            return jsonify({"erro": "Parâmetro 'codVend' deve ser um número."}), 400
 
-    # NVL(...,0) para casar com o agrupamento do /vendedores-resumo, que junta
-    # CODVEND nulo e 0 na mesma linha "SEM VENDEDOR". Sem isso, clicar naquela
-    # linha traria menos clientes do que ela mesma diz ter.
-    carteira = SELECT_RECEITAS + "\nAND NVL(FIN.CODVEND, 0) = :CODVEND"
+    carteira = SELECT_RECEITAS
+    params = {}
+    if cod_vend is not None:
+        # NVL(...,0) para casar com o agrupamento do /vendedores-resumo, que junta
+        # CODVEND nulo e 0 na mesma linha "SEM VENDEDOR". Sem isso, clicar naquela
+        # linha traria menos clientes do que ela mesma diz ter.
+        carteira += "\nAND NVL(FIN.CODVEND, 0) = :CODVEND"
+        params["CODVEND"] = cod_vend
+
     sql = CTE_CHEQUES + SQL_VENDEDOR_ENVELOPE.format(
         carteira=carteira, escopo_carteira=""
     )
@@ -2858,16 +2869,20 @@ def vendedor_360():
 
         cursor = conexao.cursor()
 
-        # Consulta à parte para o nome: se o vendedor não tiver nenhum título
-        # vencido, a consulta grande volta vazia e a tela ainda precisa dizer de
-        # quem ela está falando.
-        cursor.execute(
-            "SELECT APELIDO FROM TGFVEN WHERE CODVEND = :CODVEND", {"CODVEND": cod_vend}
-        )
-        linha = cursor.fetchone()
-        apelido = (_txt(linha[0]) if linha else None) or "SEM VENDEDOR"
+        if cod_vend is None:
+            apelido = "Todos os vendedores"
+        else:
+            # Consulta à parte para o nome: se o vendedor não tiver nenhum título
+            # vencido, a consulta grande volta vazia e a tela ainda precisa dizer
+            # de quem ela está falando.
+            cursor.execute(
+                "SELECT APELIDO FROM TGFVEN WHERE CODVEND = :CODVEND",
+                {"CODVEND": cod_vend},
+            )
+            linha = cursor.fetchone()
+            apelido = (_txt(linha[0]) if linha else None) or "SEM VENDEDOR"
 
-        cursor.execute(sql, {"CODVEND": cod_vend})
+        cursor.execute(sql, params)
 
         dados = []
         for r in cursor.fetchall():

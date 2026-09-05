@@ -1112,9 +1112,11 @@ Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linh
                "dMais365": { "qtd": 58, "valor": 88000.00 } } } ] }
 ```
 
-#### `GET /api/cobranca/vendedor-360?codVend=12`
+#### `GET /api/cobranca/vendedor-360[?codVend=12]`
 
-`codVend` é **obrigatório** (400 sem ele). Uma linha por cliente daquele vendedor — os mesmos campos do `/painel`, mais `aging` por cliente. O bloco `vendedor` traz os totais, somados das mesmas linhas de `dados`: assim o cabeçalho e o gráfico da tela nunca discordam da lista.
+`codVend` é **opcional**: sem ele vem a carteira vencida **inteira**, que é o consolidado "todos os vendedores" da tela de entrada. Esse consolidado tem de vir do banco, e não de somar as linhas do `/vendedores-resumo` no navegador — quem compra com dois vendedores tem título nos dois, e somar os `qtdClientes` contaria o mesmo cliente duas vezes. Aqui a base é o cliente, e cada um aparece uma vez só.
+
+Uma linha por cliente daquele vendedor — os mesmos campos do `/painel`, mais `aging` por cliente. O bloco `vendedor` traz os totais, somados das mesmas linhas de `dados`: assim o cabeçalho e o gráfico da tela nunca discordam da lista.
 
 ```jsonc
 { "sucesso": true, "totalRegistros": 47,
