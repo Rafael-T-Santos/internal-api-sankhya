@@ -8,6 +8,8 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
 |---|---|
 | [app.py](app.py) | Produtos, logística, contagem de estoque, conferência de entrada — e o registro dos blueprints |
 | [cobranca.py](cobranca.py) | Blueprint da Cobrança: listas de apoio, inadimplência, Visão 360°, login do operador e a régua de chamadas |
+| [cnpj.py](cnpj.py) | Blueprint do CNPJ: situação cadastral na Receita + inscrições estaduais na SEFAZ/AL |
+| [funcionarios.py](funcionarios.py) | Blueprint dos Funcionários: quadro da folha (tabelas `TFP*`) com cargo, setor, jornada e status |
 | [drive.py](drive.py) | Envio dos anexos de cobrança para o Google Drive da empresa |
 | [impostos.py](impostos.py) | Recálculo de impostos via Gateway do Sankhya (`autenticar_sankhya` é reaproveitada pela cobrança) |
 | [db.py](db.py) | `conectar_oracle()` — única função de conexão |
@@ -25,6 +27,7 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
   - [Contagem de estoque](#contagem-de-estoque)
   - [Conferência de entrada](#conferência-de-entrada)
   - [CNPJ / situação do contribuinte](#cnpj--situação-do-contribuinte)
+  - [Funcionários](#funcionários)
   - [Cobrança](#cobrança)
   - [Cobrança — operador](#cobrança--operador)
   - [Cobrança — régua de chamadas (escrita)](#cobrança--régua-de-chamadas-escrita)
@@ -729,6 +732,84 @@ O corpo da resposta é idêntico ao do `POST /api/consultar-cnpj` com `{ "cnpj":
 
 ---
 
+### Funcionários
+
+#### `GET /api/funcionarios`
+
+O quadro de funcionários da folha (`TFPFUN`), com empresa, cargo, setor, jornada e salário-base. Ordenado por empresa e depois por nome.
+
+**Todos os filtros são opcionais** e vão na querystring — sem nenhum, devolve o quadro inteiro (ativos, afastados e inativos).
+
+| Parâmetro | Tipo | Observação |
+|---|---|---|
+| `codEmp` | número | Filtra por empresa/filial |
+| `codFunc` | número | Filtra um funcionário; a chave real é `codEmp` + `codFunc` |
+| `codDep` | número | Filtra por setor (departamento) |
+| `codCargo` | número | Filtra por cargo |
+| `status` | texto | `ATIVO`, `AFASTADO` ou `INATIVO` (case-insensitive) |
+| `busca` | texto | Trecho do nome, do CPF ou da matrícula |
+
+**Como o `status` é calculado** (não existe essa coluna no Sankhya):
+
+- `INATIVO` — `TFPFUN.SITUACAO <> '1'`. Tem precedência sobre o resto.
+- `AFASTADO` — tem ocorrência (`TFPOCO`) vigente hoje (`DTINICOCOR <= hoje` e `DTFINALOCOR` nula ou `>= hoje`) cujo histórico (`TFPHIS`) é de afastamento: código em `A D G M S Y W 2 9`, **ou** código em `E J K O P R T U V Z 5 7` com `REDUZDIASTRAB = 'S'` (sem essa marca, a ocorrência não tira o funcionário do trabalho).
+- `ATIVO` — o resto.
+
+```
+GET /api/funcionarios?codEmp=1&status=ATIVO
+GET /api/funcionarios?busca=MARIA
+```
+
+```jsonc
+// 200
+{
+  "sucesso": true,
+  "totalRegistros": 87,
+  "dados": [
+    {
+      "codFunc": 42,
+      "nome": "MARIA DA SILVA",
+      "cpf": "01234567890",
+      "matricula": "000042",
+      "codEmpresa": 1,
+      "empresa": "NETO DISTRIBUIDORA LTDA",
+      "status": "ATIVO",
+      "dataAdmissao": "2019-03-11",
+      "dataDemissao": null,
+      "codCargo": 12,
+      "cargo": "AUXILIAR ADMINISTRATIVO",
+      "codSetor": 3,
+      "setor": "ADMINISTRATIVO",
+      "codJornada": 1,
+      "jornada": "44 HORAS SEMANAIS",
+      "horasSemanais": 44,
+      "salarioBase": 2100.0,
+      "dataVigenciaSalario": null,
+      "ultimaAtualizacao": "2026-08-27"
+    }
+  ]
+}
+```
+
+```jsonc
+// 400 — status fora da lista
+{ "erro": "Parâmetro 'status' deve ser ATIVO, AFASTADO ou INATIVO." }
+```
+
+```jsonc
+// 400 — filtro numérico com texto
+{ "erro": "Parâmetro 'codEmp' deve ser um número inteiro." }
+```
+
+Notas de contrato:
+
+- `dataVigenciaSalario` **vem sempre `null`**. O campo existe porque a vigência mora no histórico salarial, que ainda não foi mapeado — quando entrar, o contrato não muda.
+- `cpf` sai com 11 dígitos, zeros à esquerda preservados (na base ele pode estar como número).
+- Datas saem em `"YYYY-MM-DD"`; campos de texto em branco viram `null`.
+- Sem paginação: devolve tudo que casar com os filtros.
+
+---
+
 ### Cobrança
 
 #### `GET /api/cidades`
@@ -1175,6 +1256,9 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 | `_TRAVA_MINUTOS = 15` | [cobranca.py](cobranca.py) | Duração da trava "em chamada"; modal abandonado libera o título depois disso |
 | `_MAX_TITULOS_CHAMADA = 200` | [cobranca.py](cobranca.py) | Teto de títulos por chamada — um "selecionar tudo" acidental não trava a carteira inteira |
 | `WAIT 5` | [chamadas/iniciar](cobranca.py) | Espera máxima pelo lock em `TGFFIN`; estourar vira `409`, não `500` |
+| `SITUACAO = '1'` | [funcionarios.py](funcionarios.py) | Situação da `TFPFUN` que conta como empregado na casa; qualquer outra vira `INATIVO` |
+| Códigos `A D G M S Y W 2 9` | [funcionarios.py](funcionarios.py) | `TFPHIS.AFASTAMENTO` que já é afastamento por si só |
+| Códigos `E J K O P R T U V Z 5 7` | [funcionarios.py](funcionarios.py) | `TFPHIS.AFASTAMENTO` que só afasta com `REDUZDIASTRAB = 'S'` |
 
 ---
 
@@ -1183,6 +1267,8 @@ Valores fixos dentro do SQL que mudam o resultado e **não são parametrizáveis
 **Padrão:** `TGFPRO` (produtos), `TGFICP` (composição/fórmula), `TGFPEM` (produto × empresa), `TGFFCP`/`TGFEPR` (tributação), `TGFNUM` (numeração), `TGFTAB`/`TGFEXC` (tabelas de preço), `TGFICM` (ICMS/ST), `TGFEST` (estoque), `TGFCAB`/`TGFITE` (notas), `TGFTOP` (operações), `TGFORD`/`TGFVEI` (ordem de carga/veículos), `TGFPAR` (parceiros), `TGFVEN` (vendedores), `TGFFIN`/`VGFFIN` (financeiro), `TGFTIT` (tipos de título), `TGFOBS` (observações), `TGFMAR` (marcas), `TSICID`/`TSIEND`/`TSIBAI`/`TSIUFS` (endereços), `TSIEMP` (empresas), `TSICTA` (contas bancárias).
 
 Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
+
+**Folha (`TFP*`):** `TFPFUN` (funcionários), `TFPCAR` (cargos), `TFPDEP` (setores/departamentos), `TFPCGH` (cargas horárias/jornadas), `TFPOCO` (ocorrências do funcionário) e `TFPHIS` (históricos de ocorrência, onde mora o código de afastamento).
 
 **Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
 
@@ -1202,7 +1288,7 @@ Nada disso é bug novo — é o estado atual, documentado para quem for mexer:
 - **Servidor de desenvolvimento.** O container roda `flask run`, não um WSGI de produção (gunicorn/waitress). Single-threaded e não recomendado para carga real.
 - **Uma conexão nova por request**, aberta e fechada a cada chamada — sem pool. Sob concorrência, isso vira gargalo no Oracle.
 - **Sem healthcheck** (`/health`) e sem logging estruturado — só `print()` para stdout.
-- **Sem paginação** em `/api/parceiros`, `/api/cidades`, `/api/vendedores` e `/api/receitas-vencidas` sem filtro.
+- **Sem paginação** em `/api/parceiros`, `/api/cidades`, `/api/vendedores`, `/api/funcionarios` e `/api/receitas-vencidas` sem filtro.
 - **O nome `/api/receitas-vencidas` mente, e o campo `situacao` também.** As condições `FIN.DTVENC < TRUNC(SYSDATE)` estão comentadas em `SELECT_RECEITAS` **de propósito**: a tela que consome este endpoint mostra títulos a vencer também, e usa os filtros de data para recortar o período. O endpoint devolve, portanto, todo título em aberto (hoje: 8.068 no total, sendo 1.246 vencidos e 6.822 a vencer). O problema real não é o filtro, é a nomenclatura — e principalmente o campo `situacao`, que rotula como `TÍTULO VENCIDO SEM PAGAMENTO` títulos que **ainda não venceram**. Isso é dado incorreto, não só nome ruim. Renomeação de endpoint/tela/rótulo está planejada.
 - **Quase sem testes.** Só a régua de chamadas tem cobertura ([tests/smoke-chamadas.ps1](#testes)); os outros 4 domínios não têm nenhuma.
 

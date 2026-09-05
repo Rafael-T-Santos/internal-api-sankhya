@@ -5,6 +5,7 @@ from flask_cors import CORS
 from db import conectar_oracle
 from cobranca import bp as cobranca_bp
 from cnpj import bp as cnpj_bp
+from funcionarios import bp as funcionarios_bp
 from impostos import (
     bp as impostos_bp,
     limpar_impostos,
@@ -25,6 +26,9 @@ app.register_blueprint(impostos_bp)
 
 # Rotas do módulo de CNPJ / situação do contribuinte em AL (ver cnpj.py).
 app.register_blueprint(cnpj_bp)
+
+# Rotas do módulo de Funcionários / folha de pagamento (ver funcionarios.py).
+app.register_blueprint(funcionarios_bp)
 
 # --- Endpoints da API ---
 
