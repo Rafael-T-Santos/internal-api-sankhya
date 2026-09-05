@@ -2754,7 +2754,13 @@ SQL_VENDEDOR_ENVELOPE = (
 
 # Tela de entrada: uma linha por vendedor. Não precisa da régua nem da agenda —
 # só da carteira e de quantos clientes dela já receberam alguma chamada.
-SQL_VENDEDORES_RESUMO = SQL_CTE_CARTEIRA + """
+#
+# ⚠️ O `.rstrip()` da vírgula NÃO é firula: as constantes SQL_CTE_* terminam com
+# ")," porque nas outras duas consultas sempre vem outra CTE depois. Aqui o
+# SELECT vem logo em seguida, e "), SELECT" faz o Oracle procurar mais uma CTE e
+# devolver ORA-00903 (nome de tabela inválido) — que foi exatamente o erro que
+# esta consulta deu em produção na primeira subida.
+SQL_VENDEDORES_RESUMO = SQL_CTE_CARTEIRA.rstrip().rstrip(",") + """
 SELECT ca.CODVEND,
        NVL(ven.APELIDO, 'SEM VENDEDOR') AS APELIDO,
        COUNT(DISTINCT ca.CODPARC) AS QTD_CLIENTES,
