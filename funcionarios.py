@@ -9,6 +9,8 @@ funcionário junto com `CODEMP`; sem ele o consumidor não tem como identificar 
 registro) e os filtros opcionais aplicados por fora, sempre em bind variables.
 """
 
+import re
+
 from flask import Blueprint, jsonify, request
 
 from db import conectar_oracle
@@ -200,12 +202,28 @@ def funcionarios():
         # TO_CHAR em CPF/MATRICULA: nas bases da folha esses campos aparecem ora
         # como texto, ora como número — sem o cast o LIKE depende de conversão
         # implícita (e do NLS) para funcionar.
-        filtros.append(
-            "(UPPER(NOME) LIKE '%' || UPPER(:BUSCA) || '%'"
-            " OR TO_CHAR(CPF) LIKE '%' || :BUSCA || '%'"
-            " OR UPPER(TO_CHAR(MATRICULA)) LIKE '%' || UPPER(:BUSCA) || '%')"
-        )
+        condicoes = [
+            "UPPER(NOME) LIKE '%' || UPPER(:BUSCA) || '%'",
+            "UPPER(TO_CHAR(MATRICULA)) LIKE '%' || UPPER(:BUSCA) || '%'",
+        ]
         binds["BUSCA"] = busca
+
+        # CPF é comparado só por dígito, dos dois lados:
+        #   - na coluna, porque o CPF pode estar como NUMBER (e aí o zero à
+        #     esquerda some no TO_CHAR) ou como texto com máscara;
+        #   - no termo digitado, porque quem busca costuma colar o CPF pontuado.
+        # Sem isso, procurar "01234567890" não achava o funcionário cujo `cpf`
+        # a própria resposta devolve como "01234567890".
+        digitos = re.sub(r"\D", "", busca)
+        if digitos:
+            condicoes.insert(
+                1,
+                "LPAD(REGEXP_REPLACE(TO_CHAR(CPF), '[^0-9]'), 11, '0')"
+                " LIKE '%' || :BUSCACPF || '%'",
+            )
+            binds["BUSCACPF"] = digitos
+
+        filtros.append("(" + " OR ".join(condicoes) + ")")
 
     sql = SELECT_FUNCIONARIOS
     if filtros:

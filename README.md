@@ -747,7 +747,7 @@ O quadro de funcionários da folha (`TFPFUN`), com empresa, cargo, setor, jornad
 | `codDep` | número | Filtra por setor (departamento) |
 | `codCargo` | número | Filtra por cargo |
 | `status` | texto | `ATIVO`, `AFASTADO` ou `INATIVO` (case-insensitive) |
-| `busca` | texto | Trecho do nome, do CPF ou da matrícula |
+| `busca` | texto | Trecho do nome, do CPF ou da matrícula. O CPF é comparado só por dígito — aceita com ou sem máscara e com ou sem o zero à esquerda |
 
 **Como o `status` é calculado** (não existe essa coluna no Sankhya):
 
@@ -805,6 +805,7 @@ Notas de contrato:
 
 - `dataVigenciaSalario` **vem sempre `null`**. O campo existe porque a vigência mora no histórico salarial, que ainda não foi mapeado — quando entrar, o contrato não muda.
 - `cpf` sai com 11 dígitos, zeros à esquerda preservados (na base ele pode estar como número).
+- A `busca` por CPF normaliza os dois lados (`LPAD(REGEXP_REPLACE(...))` na coluna, só os dígitos no termo), então `01234567890`, `1234567890` e `123.456.789-00` acham o mesmo funcionário. Nome e matrícula continuam sendo `LIKE` de texto, sem normalização.
 - Datas saem em `"YYYY-MM-DD"`; campos de texto em branco viram `null`.
 - Sem paginação: devolve tudo que casar com os filtros.
 
