@@ -301,6 +301,33 @@ CHEQUES_REGRA AS (
     SELECT STATUS_REGRA, ORIGEM_REGRA, NUFIN, CHEQUE,
            VLRCHEQUE_REGRA, DATACHEQUE_REGRA, ULTIMO_EVENTO_REGRA
     FROM DEV_1657
+),
+/* A renegociação pode gerar novo título com CODVEND = 0 e NUNOTA nula.
+   Nessa situação, recupera o vendedor interno das origens neutralizadas
+   (RECDESP = 0) somente quando TODAS as origens da mesma renegociação/parceiro
+   possuem vendedor interno e todas apontam para o mesmo código. Se houver
+   mistura ou alguma origem sem vendedor, não força associação. */
+RENEG_VENDEDOR AS (
+    SELECT
+        F_ORIG.NURENEG,
+        F_ORIG.CODPARC,
+        CASE
+            WHEN COUNT(*) = SUM(
+                     CASE WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                          THEN 1 ELSE 0 END
+                 )
+             AND COUNT(DISTINCT CASE
+                     WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                     THEN CAB_ORIG.AD_CODVENDINT
+                 END) = 1
+            THEN MAX(CAB_ORIG.AD_CODVENDINT)
+        END AS CODVENDINT_RENEG
+    FROM TGFFIN F_ORIG
+        LEFT JOIN TGFCAB CAB_ORIG
+               ON CAB_ORIG.NUNOTA = F_ORIG.NUNOTA
+    WHERE F_ORIG.RECDESP = 0
+      AND F_ORIG.NURENEG IS NOT NULL
+    GROUP BY F_ORIG.NURENEG, F_ORIG.CODPARC
 )
 """
 
@@ -310,25 +337,33 @@ DT_EFETIVA = """
 """
 
 # Vendedor efetivo da cobrança:
-# - CODVEND > 0 continua sendo soberano;
-# - somente quando CODVEND é 0/nulo, usa AD_CODVENDINT da venda, se informado.
+# 1) CODVEND > 0 continua sendo soberano;
+# 2) com CODVEND 0/nulo, usa AD_CODVENDINT da venda direta;
+# 3) título renegociado que perdeu NUNOTA herda o vendedor interno das origens
+#    somente quando todas as origens da mesma NURENEG/parceiro têm o mesmo código.
 CODVEND_EFETIVO = """
     CASE
-        WHEN NVL(FIN.CODVEND, 0) = 0
-         AND NVL(CAB.AD_CODVENDINT, 0) > 0
+        WHEN NVL(FIN.CODVEND, 0) > 0
+        THEN FIN.CODVEND
+
+        WHEN NVL(CAB.AD_CODVENDINT, 0) > 0
         THEN CAB.AD_CODVENDINT
-        ELSE NVL(FIN.CODVEND, 0)
+
+        WHEN NVL(RENV.CODVENDINT_RENEG, 0) > 0
+        THEN RENV.CODVENDINT_RENEG
+
+        ELSE 0
     END
 """
 
 # De onde saiu o CODVEND_EFETIVO: 'TITULO' (FIN.CODVEND), 'INTERNO'
-# (TGFCAB.AD_CODVENDINT) ou NULL (sem vendedor). Existe para a tela mostrar que o
-# vendedor foi herdado da nota — quem confere no Sankhya vê o título sem vendedor
-# e acharia que a tela está errada. Tem de seguir a mesma ordem do CASE acima.
+# (TGFCAB.AD_CODVENDINT), 'RENEGOCIACAO' (origens da mesma NURENEG) ou NULL.
+# Tem de seguir a mesma ordem do CASE acima.
 ORIGEM_VENDEDOR = """
     CASE
         WHEN NVL(FIN.CODVEND, 0) > 0 THEN 'TITULO'
         WHEN NVL(CAB.AD_CODVENDINT, 0) > 0 THEN 'INTERNO'
+        WHEN NVL(RENV.CODVENDINT_RENEG, 0) > 0 THEN 'RENEGOCIACAO'
     END
 """
 
@@ -337,6 +372,9 @@ JOINS_TITULO = f"""
     FROM TGFFIN FIN
         INNER JOIN TGFPAR PAR  ON PAR.CODPARC      = FIN.CODPARC
         LEFT JOIN TGFCAB CAB   ON CAB.NUNOTA       = FIN.NUNOTA
+        LEFT JOIN RENEG_VENDEDOR RENV
+                               ON RENV.NURENEG       = FIN.NURENEG
+                              AND RENV.CODPARC       = FIN.CODPARC
         LEFT JOIN TSICID CID   ON CID.CODCID       = PAR.CODCID
         LEFT JOIN TSIUFS UFS   ON UFS.CODUF        = CID.UF
         LEFT JOIN TGFTIT TIT   ON TIT.CODTIPTIT    = FIN.CODTIPTIT
