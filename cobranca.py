@@ -2718,9 +2718,10 @@ def painel():
 # chamadas entram por LEFT JOIN. É o oposto do painel, e de propósito — mostrar
 # quem está FORA do radar da cobrança é o motivo desta tela existir.
 #
-# ⚠️ O vendedor sai do TÍTULO quando FIN.CODVEND > 0. Somente quando ele está
-# zerado/nulo, a cobrança herda TGFCAB.AD_CODVENDINT da venda. O cadastro do
-# cliente (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
+# ⚠️ O vendedor sai do TÍTULO quando FIN.CODVEND > 0. Quando está zerado/nulo,
+# a cobrança herda TGFCAB.AD_CODVENDINT da venda; se a renegociação gerou título
+# sem NUNOTA, pode herdar o único vendedor interno comum às origens neutralizadas.
+# O cadastro do cliente (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
 # telas, cada uma somando só os títulos dela — por isso o total do cliente aqui
 # pode ser MENOR que o da Visão 360° dele, que mostra tudo. É a leitura certa
 # para "títulos por vendedor" e a mesma que o filtro de vendedor da tela de
