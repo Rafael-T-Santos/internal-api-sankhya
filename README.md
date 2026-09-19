@@ -1179,11 +1179,11 @@ Duas leituras da **mesma** carteira vencida, agrupada de dois jeitos. Plano: `da
 
 Diferença de fundo para o painel: aqui a base é a **carteira** e as chamadas entram por `LEFT JOIN` — o oposto do painel, e de propósito. Mostrar quem está **fora do radar** da cobrança é o motivo destas rotas existirem.
 
-⚠️ O vendedor sai do **título** (`FIN.CODVEND`), não do cadastro do cliente. Título sem vendedor no financeiro herda o vendedor interno da nota (`TGFCAB.AD_CODVENDINT`) — a regra completa está no [`/receitas-vencidas`](#post-apireceitas-vencidas). Cliente que comprou com dois vendedores aparece nos dois, cada um somando só os títulos dele — então o total de um cliente aqui pode ser **menor** que o da Visão 360° dele, que mostra tudo. É a mesma leitura do filtro de vendedor do `/receitas-vencidas`.
+⚠️ O vendedor sai do **título** (`FIN.CODVEND`), não do cadastro do cliente. Título sem vendedor no financeiro herda o vendedor interno da nota (`TGFCAB.AD_CODVENDINT`); se uma renegociação gerar título sem `NUNOTA`, pode herdar o vendedor interno comum às origens neutralizadas — a regra completa está no [`/receitas-vencidas`](#post-apireceitas-vencidas). Cliente que comprou com dois vendedores aparece nos dois, cada um somando só os títulos dele — então o total de um cliente aqui pode ser **menor** que o da Visão 360° dele, que mostra tudo. É a mesma leitura do filtro de vendedor do `/receitas-vencidas`.
 
 #### `GET /api/cobranca/vendedores-resumo`
 
-Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linha "SEM VENDEDOR": título sem vendedor no financeiro **e** sem vendedor interno na nota — dívida real, só sem dono. Se o `AD_CODVENDINT` da nota apontar para um código que não existe na `TGFVEN`, a linha sai com esse `codVend` e apelido "SEM VENDEDOR" — é cadastro a corrigir no Sankhya.
+Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linha "SEM VENDEDOR": título sem vendedor no financeiro, sem vendedor interno direto pela nota e sem vendedor único recuperável da renegociação — dívida real, só sem dono. Se o `AD_CODVENDINT` resolvido apontar para um código que não existe na `TGFVEN`, a linha sai com esse `codVend` e apelido "SEM VENDEDOR" — é cadastro a corrigir no Sankhya.
 
 ```jsonc
 { "sucesso": true, "totalRegistros": 18, "dados": [
