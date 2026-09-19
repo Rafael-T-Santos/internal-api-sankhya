@@ -309,14 +309,27 @@ DT_EFETIVA = """
     CASE WHEN FIN.CODTIPTIT = 3 THEN CHR.DATACHEQUE_REGRA ELSE FIN.DTVENC END
 """
 
+# Vendedor efetivo da cobrança:
+# - CODVEND > 0 continua sendo soberano;
+# - somente quando CODVEND é 0/nulo, usa AD_CODVENDINT da venda, se informado.
+CODVEND_EFETIVO = """
+    CASE
+        WHEN NVL(FIN.CODVEND, 0) = 0
+         AND NVL(CAB.AD_CODVENDINT, 0) > 0
+        THEN CAB.AD_CODVENDINT
+        ELSE NVL(FIN.CODVEND, 0)
+    END
+"""
+
 # JOINs comuns às consultas de títulos.
-JOINS_TITULO = """
+JOINS_TITULO = f"""
     FROM TGFFIN FIN
         INNER JOIN TGFPAR PAR  ON PAR.CODPARC      = FIN.CODPARC
+        LEFT JOIN TGFCAB CAB   ON CAB.NUNOTA       = FIN.NUNOTA
         LEFT JOIN TSICID CID   ON CID.CODCID       = PAR.CODCID
         LEFT JOIN TSIUFS UFS   ON UFS.CODUF        = CID.UF
         LEFT JOIN TGFTIT TIT   ON TIT.CODTIPTIT    = FIN.CODTIPTIT
-        LEFT JOIN TGFVEN VEN   ON VEN.CODVEND      = FIN.CODVEND
+        LEFT JOIN TGFVEN VEN   ON VEN.CODVEND      = {CODVEND_EFETIVO}
         LEFT JOIN TSICTA CTA   ON CTA.CODCTABCOINT = FIN.CODCTABCOINT
         LEFT JOIN TGFOBS OBS   ON OBS.CODOBSPADRAO = FIN.CODOBSPADRAO
         LEFT JOIN VGFFIN VFIN  ON VFIN.NUFIN       = FIN.NUFIN
@@ -461,7 +474,7 @@ SELECT
        deslocaria todas as seguintes. Existe para a Visão 360° por Vendedor poder
        AGRUPAR por vendedor — o APELIDO acima é só rótulo e não tem alias, então
        não serve como chave. Ver docs/VENDEDOR-360.md §3. */
-    FIN.CODVEND
+    {CODVEND_EFETIVO} AS CODVEND
 {JOINS_TITULO}
 WHERE FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
@@ -505,8 +518,8 @@ def receitas_vencidas():
     if cod_parc:
         filtros.append("AND FIN.CODPARC = :CODPARC")
         params["CODPARC"] = cod_parc
-    if cod_vend:
-        filtros.append("AND FIN.CODVEND = :CODVEND")
+    if cod_vend is not None:
+        filtros.append(f"AND ({CODVEND_EFETIVO}) = :CODVEND")
         params["CODVEND"] = cod_vend
     if cod_cid:
         filtros.append("AND PAR.CODCID = :CODCID")
@@ -2602,14 +2615,14 @@ def painel():
     """
     filtros = []
     params = {}
-    for campo, coluna in (("codVend", "FIN.CODVEND"), ("codCid", "PAR.CODCID")):
+    for campo, coluna in (("codVend", CODVEND_EFETIVO), ("codCid", "PAR.CODCID")):
         valor = request.args.get(campo)
         if valor not in (None, ""):
             try:
                 params[campo.upper()] = int(valor)
             except ValueError:
                 return jsonify({"erro": f"Parâmetro '{campo}' deve ser um número."}), 400
-            filtros.append(f"AND {coluna} = :{campo.upper()}")
+            filtros.append(f"AND ({coluna}) = :{campo.upper()}")
 
     carteira = SELECT_RECEITAS + "\n" + "\n".join(filtros)
     sql = CTE_CHEQUES + SQL_PAINEL_ENVELOPE.format(
@@ -2648,8 +2661,9 @@ def painel():
 # chamadas entram por LEFT JOIN. É o oposto do painel, e de propósito — mostrar
 # quem está FORA do radar da cobrança é o motivo desta tela existir.
 #
-# ⚠️ O vendedor sai do TÍTULO (FIN.CODVEND), não do cadastro do cliente
-# (PAR.CODVEND). Um cliente que comprou com dois vendedores aparece nas duas
+# ⚠️ O vendedor sai do TÍTULO quando FIN.CODVEND > 0. Somente quando ele está
+# zerado/nulo, a cobrança herda TGFCAB.AD_CODVENDINT da venda. O cadastro do
+# cliente (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
 # telas, cada uma somando só os títulos dela — por isso o total do cliente aqui
 # pode ser MENOR que o da Visão 360° dele, que mostra tudo. É a leitura certa
 # para "títulos por vendedor" e a mesma que o filtro de vendedor da tela de
@@ -2854,7 +2868,7 @@ def vendedor_360():
         # NVL(...,0) para casar com o agrupamento do /vendedores-resumo, que junta
         # CODVEND nulo e 0 na mesma linha "SEM VENDEDOR". Sem isso, clicar naquela
         # linha traria menos clientes do que ela mesma diz ter.
-        carteira += "\nAND NVL(FIN.CODVEND, 0) = :CODVEND"
+        carteira += f"\nAND ({CODVEND_EFETIVO}) = :CODVEND"
         params["CODVEND"] = cod_vend
 
     sql = CTE_CHEQUES + SQL_VENDEDOR_ENVELOPE.format(
