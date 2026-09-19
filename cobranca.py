@@ -303,31 +303,38 @@ CHEQUES_REGRA AS (
     FROM DEV_1657
 ),
 /* A renegociação pode gerar novo título com CODVEND = 0 e NUNOTA nula.
-   Nessa situação, recupera o vendedor interno das origens neutralizadas
-   (RECDESP = 0) somente quando TODAS as origens da mesma renegociação/parceiro
-   possuem vendedor interno e todas apontam para o mesmo código. Se houver
-   mistura ou alguma origem sem vendedor, não força associação. */
+   Nessa situação, recupera o vendedor EFETIVO das origens neutralizadas
+   (RECDESP = 0), com a mesma prioridade da cobrança: CODVEND do financeiro
+   primeiro e AD_CODVENDINT da nota como fallback. Só herda quando TODAS as
+   origens da mesma renegociação/parceiro possuem vendedor e apontam para o
+   mesmo código. Se houver mistura ou alguma origem sem vendedor, não força
+   associação. */
 RENEG_VENDEDOR AS (
     SELECT
-        F_ORIG.NURENEG,
-        F_ORIG.CODPARC,
+        NURENEG,
+        CODPARC,
         CASE
-            WHEN COUNT(*) = SUM(
-                     CASE WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
-                          THEN 1 ELSE 0 END
-                 )
-             AND COUNT(DISTINCT CASE
-                     WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
-                     THEN CAB_ORIG.AD_CODVENDINT
-                 END) = 1
-            THEN MAX(CAB_ORIG.AD_CODVENDINT)
-        END AS CODVENDINT_RENEG
-    FROM TGFFIN F_ORIG
-        LEFT JOIN TGFCAB CAB_ORIG
-               ON CAB_ORIG.NUNOTA = F_ORIG.NUNOTA
-    WHERE F_ORIG.RECDESP = 0
-      AND F_ORIG.NURENEG IS NOT NULL
-    GROUP BY F_ORIG.NURENEG, F_ORIG.CODPARC
+            WHEN COUNT(*) = COUNT(CODVEND_ORIG)
+             AND COUNT(DISTINCT CODVEND_ORIG) = 1
+            THEN MAX(CODVEND_ORIG)
+        END AS CODVEND_RENEG
+    FROM (
+        SELECT
+            F_ORIG.NURENEG,
+            F_ORIG.CODPARC,
+            CASE
+                WHEN NVL(F_ORIG.CODVEND, 0) > 0
+                THEN F_ORIG.CODVEND
+                WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                THEN CAB_ORIG.AD_CODVENDINT
+            END AS CODVEND_ORIG
+        FROM TGFFIN F_ORIG
+            LEFT JOIN TGFCAB CAB_ORIG
+                   ON CAB_ORIG.NUNOTA = F_ORIG.NUNOTA
+        WHERE F_ORIG.RECDESP = 0
+          AND F_ORIG.NURENEG IS NOT NULL
+    )
+    GROUP BY NURENEG, CODPARC
 )
 """
 
@@ -339,7 +346,7 @@ DT_EFETIVA = """
 # Vendedor efetivo da cobrança:
 # 1) CODVEND > 0 continua sendo soberano;
 # 2) com CODVEND 0/nulo, usa AD_CODVENDINT da venda direta;
-# 3) título renegociado que perdeu NUNOTA herda o vendedor interno das origens
+# 3) título renegociado que perdeu NUNOTA herda o vendedor efetivo das origens
 #    somente quando todas as origens da mesma NURENEG/parceiro têm o mesmo código.
 CODVEND_EFETIVO = """
     CASE
@@ -350,8 +357,8 @@ CODVEND_EFETIVO = """
         THEN CAB.AD_CODVENDINT
 
         WHEN FIN.NUNOTA IS NULL
-         AND NVL(RENV.CODVENDINT_RENEG, 0) > 0
-        THEN RENV.CODVENDINT_RENEG
+         AND NVL(RENV.CODVEND_RENEG, 0) > 0
+        THEN RENV.CODVEND_RENEG
 
         ELSE 0
     END
@@ -365,7 +372,7 @@ ORIGEM_VENDEDOR = """
         WHEN NVL(FIN.CODVEND, 0) > 0 THEN 'TITULO'
         WHEN NVL(CAB.AD_CODVENDINT, 0) > 0 THEN 'INTERNO'
         WHEN FIN.NUNOTA IS NULL
-         AND NVL(RENV.CODVENDINT_RENEG, 0) > 0 THEN 'RENEGOCIACAO'
+         AND NVL(RENV.CODVEND_RENEG, 0) > 0 THEN 'RENEGOCIACAO'
     END
 """
 
@@ -2720,7 +2727,7 @@ def painel():
 #
 # ⚠️ O vendedor sai do TÍTULO quando FIN.CODVEND > 0. Quando está zerado/nulo,
 # a cobrança herda TGFCAB.AD_CODVENDINT da venda; se a renegociação gerou título
-# sem NUNOTA, pode herdar o único vendedor interno comum às origens neutralizadas.
+# sem NUNOTA, pode herdar o único vendedor efetivo comum às origens neutralizadas.
 # O cadastro do cliente (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
 # telas, cada uma somando só os títulos dela — por isso o total do cliente aqui
 # pode ser MENOR que o da Visão 360° dele, que mostra tudo. É a leitura certa
