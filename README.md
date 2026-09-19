@@ -854,7 +854,7 @@ O relatório de inadimplência: títulos e cheques vencidos/pendentes.
 |---|---|---|
 | `codEmp` | número | Filtra por empresa |
 | `codParc` | número | Filtra por parceiro |
-| `codVend` | número | Filtra por vendedor |
+| `codVend` | número | Filtra pelo vendedor **efetivo** do título (ver abaixo). `0` filtra os títulos "SEM VENDEDOR"; ausente, `null` ou `""` não filtra |
 | `codCid` | número | Filtra pela cidade **do parceiro** |
 | `dtInicial` | `"YYYY-MM-DD"` | Intervalo de `DTVENC`. Só aplicado **se `dtFinal` também vier** |
 | `dtFinal` | `"YYYY-MM-DD"` | Idem — os dois andam juntos, enviar só um é ignorado |
@@ -868,6 +868,8 @@ O relatório de inadimplência: títulos e cheques vencidos/pendentes.
   - **em aberto** (`CHQ_ABERTO`): ainda sem baixa nenhuma no financeiro. Não filtra `AD_ACERTADO` (na prática esses cheques vêm com `'S'`) e aceita cheque sem registro na `TGFCHQ` — aí o número sai da nota e a data efetiva é o `DTVENC`;
   - **devolvido** (`DEV_1657`): entrou pela TOP `1657` e continua sem baixa.
   Cheque que já tem devolução correspondente não entra duas vezes: quem vale é a devolução.
+
+**Vendedor do título (`vendedor`, `origemVendedor`).** Vale o vendedor do financeiro (`TGFFIN.CODVEND`) quando ele é maior que zero. Só quando o título está sem vendedor (`0`/nulo) ele herda o vendedor interno da nota (`TGFCAB.AD_CODVENDINT`, pelo `NUNOTA`). O cadastro do cliente (`TGFPAR.CODVEND`) não participa. `origemVendedor` diz de onde o nome saiu: `"TITULO"`, `"INTERNO"` (herdado da nota — no Sankhya o título aparece sem vendedor) ou `null` (sem vendedor). Título gerado por renegociação costuma não ter `NUNOTA`, então não herda e fica sem vendedor. A mesma regra vale no `/painel`, no `/vendedores-resumo` e no `/vendedor-360`.
 
 A coluna `situacao` traduz esses casos em texto: `CHEQUE PENDENTE`, `CHEQUE EM ABERTO`, `CHEQUE DEVOLVIDO`, `TÍTULO RENEGOCIADO VENCIDO SEM PAGAMENTO` ou `TÍTULO VENCIDO SEM PAGAMENTO`. Para cheque, a data que vale é o "bom para" (`TGFCHQ.DATACHEQUE`), e `atrasoDias` é calculado sobre ela.
 
@@ -891,7 +893,7 @@ A coluna `situacao` traduz esses casos em texto: `CHEQUE PENDENTE`, `CHEQUE EM A
       "codParc": 100, "nomeParc": "CLIENTE X", "razaoSocial": "CLIENTE X LTDA",
       "cnpjCpf": "12.345.678/0001-99", "telefone": "81999998888",
       "codCid": 2531, "nomeCid": "RECIFE", "uf": "PE",
-      "vendedor": "CARLOS",
+      "vendedor": "CARLOS", "origemVendedor": "TITULO",
       "tipoTitulo": "DUPLICATA", "situacao": "TITULO VENCIDO SEM PAGAMENTO",
       "historico": "VENDA", "contaBancaria": "BANCO X",
       "cgcCpfCmc7": null, "nomeEmitente": null,
@@ -1177,11 +1179,11 @@ Duas leituras da **mesma** carteira vencida, agrupada de dois jeitos. Plano: `da
 
 Diferença de fundo para o painel: aqui a base é a **carteira** e as chamadas entram por `LEFT JOIN` — o oposto do painel, e de propósito. Mostrar quem está **fora do radar** da cobrança é o motivo destas rotas existirem.
 
-⚠️ O vendedor sai do **título** (`FIN.CODVEND`), não do cadastro do cliente. Cliente que comprou com dois vendedores aparece nos dois, cada um somando só os títulos dele — então o total de um cliente aqui pode ser **menor** que o da Visão 360° dele, que mostra tudo. É a mesma leitura do filtro de vendedor do `/receitas-vencidas`.
+⚠️ O vendedor sai do **título** (`FIN.CODVEND`), não do cadastro do cliente. Título sem vendedor no financeiro herda o vendedor interno da nota (`TGFCAB.AD_CODVENDINT`) — a regra completa está no [`/receitas-vencidas`](#post-apireceitas-vencidas). Cliente que comprou com dois vendedores aparece nos dois, cada um somando só os títulos dele — então o total de um cliente aqui pode ser **menor** que o da Visão 360° dele, que mostra tudo. É a mesma leitura do filtro de vendedor do `/receitas-vencidas`.
 
 #### `GET /api/cobranca/vendedores-resumo`
 
-Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linha "SEM VENDEDOR": título sem vendedor no financeiro — dívida real, só sem dono.
+Uma linha por vendedor, sem filtro (são poucas dezenas). `codVend: 0` é a linha "SEM VENDEDOR": título sem vendedor no financeiro **e** sem vendedor interno na nota — dívida real, só sem dono. Se o `AD_CODVENDINT` da nota apontar para um código que não existe na `TGFVEN`, a linha sai com esse `codVend` e apelido "SEM VENDEDOR" — é cadastro a corrigir no Sankhya.
 
 ```jsonc
 { "sucesso": true, "totalRegistros": 18, "dados": [
@@ -1272,6 +1274,8 @@ Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
 **Folha (`TFP*`):** `TFPFUN` (funcionários), `TFPCAR` (cargos), `TFPDEP` (setores/departamentos), `TFPCGH` (cargas horárias/jornadas), `TFPOCO` (ocorrências do funcionário) e `TFPHIS` (históricos de ocorrência, onde mora o código de afastamento).
 
 **Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
+
+**Campos customizados em tabelas padrão:** `TGFCAB.AD_CODVENDINT` (vendedor interno da nota), usado pela cobrança como vendedor do título quando `TGFFIN.CODVEND` está vazio.
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
 

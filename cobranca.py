@@ -321,6 +321,17 @@ CODVEND_EFETIVO = """
     END
 """
 
+# De onde saiu o CODVEND_EFETIVO: 'TITULO' (FIN.CODVEND), 'INTERNO'
+# (TGFCAB.AD_CODVENDINT) ou NULL (sem vendedor). Existe para a tela mostrar que o
+# vendedor foi herdado da nota — quem confere no Sankhya vê o título sem vendedor
+# e acharia que a tela está errada. Tem de seguir a mesma ordem do CASE acima.
+ORIGEM_VENDEDOR = """
+    CASE
+        WHEN NVL(FIN.CODVEND, 0) > 0 THEN 'TITULO'
+        WHEN NVL(CAB.AD_CODVENDINT, 0) > 0 THEN 'INTERNO'
+    END
+"""
+
 # JOINs comuns às consultas de títulos.
 JOINS_TITULO = f"""
     FROM TGFFIN FIN
@@ -474,7 +485,8 @@ SELECT
        deslocaria todas as seguintes. Existe para a Visão 360° por Vendedor poder
        AGRUPAR por vendedor — o APELIDO acima é só rótulo e não tem alias, então
        não serve como chave. Ver docs/VENDEDOR-360.md §3. */
-    {CODVEND_EFETIVO} AS CODVEND
+    {CODVEND_EFETIVO} AS CODVEND,
+    {ORIGEM_VENDEDOR} AS ORIGEM_VENDEDOR
 {JOINS_TITULO}
 WHERE FIN.RECDESP = 1
   AND NVL(FIN.PROVISAO, 'N') = 'N'
@@ -518,7 +530,10 @@ def receitas_vencidas():
     if cod_parc:
         filtros.append("AND FIN.CODPARC = :CODPARC")
         params["CODPARC"] = cod_parc
-    if cod_vend is not None:
+    # `is not None` e não truthy: codVend 0 é um filtro válido ("SEM VENDEDOR",
+    # a mesma linha do /vendedores-resumo). "" é tratado como ausente — no Oracle
+    # '' é NULL e o filtro devolveria zero linhas.
+    if cod_vend not in (None, ""):
         filtros.append(f"AND ({CODVEND_EFETIVO}) = :CODVEND")
         params["CODVEND"] = cod_vend
     if cod_cid:
@@ -592,6 +607,8 @@ def receitas_vencidas():
                     "recDesp": row[36],
                     "codTipOper": row[37],
                     "operacao": _txt(row[38]),
+                    # row[39] é o CODVEND (usado só pelas telas por vendedor).
+                    "origemVendedor": row[40],
                 }
             )
 
