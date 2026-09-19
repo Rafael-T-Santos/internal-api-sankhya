@@ -33,3 +33,31 @@ Ao adicionar um endpoint, siga o formato dos existentes:
 `DB_USER`, `DB_PASS`, `DB_DSN` vêm do `.env` (não versionado). Sem elas, toda requisição responde 500.
 
 Rodar: `docker compose up -d --build` → `http://localhost:5000`.
+
+## GBrain Search Guidance (configurado por /setup-gbrain)
+<!-- gstack-gbrain-search-guidance:start -->
+
+Esta máquina tem o gbrain instalado e registrado como MCP (`mcp__gbrain__*`).
+**Use o gbrain** quando a pergunta for semântica ou quando você ainda não souber o
+identificador exato. Não caia direto no Grep por reflexo.
+
+Prefira gbrain quando:
+- "Onde X é tratado?" / intenção semântica, sem string exata ainda:
+    `gbrain search "<termos>"` ou `gbrain query "<pergunta>"`
+- "Onde o símbolo Y é definido?" / pergunta baseada em símbolo:
+    `gbrain code-def <símbolo>` ou `gbrain code-refs <símbolo>`
+- "O que chama Y?" / "Do que Y depende?":
+    `gbrain code-callers <símbolo>` / `gbrain code-callees <símbolo>`
+- "O que decidimos da última vez?" / planos, retros e aprendizados anteriores:
+    `gbrain search "<termos>"`
+
+Grep continua sendo o certo para string exata conhecida, regex, padrão multilinha
+e glob de arquivo.
+
+Pré-requisito neste repositório: ele precisa ser indexado uma vez antes que
+`gbrain search` devolva algo. Rode na raiz do repo:
+    `gbrain import . --no-embed && gbrain embed --stale`
+Enquanto não estiver indexado, `gbrain search` volta vazio — nesse caso diga isso
+em vez de fingir que o brain respondeu, e use Grep.
+
+<!-- gstack-gbrain-search-guidance:end -->
