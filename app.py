@@ -3,7 +3,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from db import conectar_oracle
+from auth import bp as auth_bp
 from cobranca import bp as cobranca_bp
+from televendas import bp as televendas_bp
 from cnpj import bp as cnpj_bp
 from funcionarios import bp as funcionarios_bp
 from impostos import (
@@ -18,8 +20,14 @@ app = Flask(__name__)
 # Permite que o frontend (localhost:8080) acesse a API (localhost:5000)
 CORS(app)
 
+# Login com usuário/senha do Sankhya + sessão, compartilhado (ver auth.py).
+app.register_blueprint(auth_bp)
+
 # Rotas do módulo de Cobrança (ver cobranca.py).
 app.register_blueprint(cobranca_bp)
+
+# Rotas do módulo de Televendas (ver televendas.py).
+app.register_blueprint(televendas_bp)
 
 # Rotas do módulo de Impostos / recálculo tributário via API Sankhya (ver impostos.py).
 app.register_blueprint(impostos_bp)
