@@ -14,7 +14,7 @@ class Cur:
     def __init__(s, cenario): s.c=cenario; s.r=None
     def execute(s, sql, binds=None):
         if "TSIUSU" in sql and "UPPER(NOMEUSU)" in sql: s.r=[(25,"RAFAEL")]
-        elif "AD_TLVPERFIL" in sql:
+        elif "AD_PERFILTVL" in sql:
             if s.c=="semtabela": raise cx_Oracle.DatabaseError("ORA-00942: table or view does not exist")
             s.r={"gerente":[("GERENTE","S")],"operador":[("OPERADOR","S")],"inativo":[("OPERADOR","N")],"sem":[]}[s.c]
         elif "TGFVEN" in sql: s.r=[] if s.c=="gerente" else [(41,"ANA TLV")]
@@ -49,7 +49,7 @@ chk("gerente sem vendedor -> codVend null", r.status_code==200 and r.json["codVe
 cen["v"]="inativo"; chk("perfil inativo 403", c.get("/api/televendas/sessao",headers=H).status_code==403)
 cen["v"]="sem"; chk("sem perfil 403", c.get("/api/televendas/sessao",headers=H).status_code==403)
 cen["v"]="semtabela"; r=c.get("/api/televendas/sessao",headers=H)
-chk("tabela inexistente 503", r.status_code==503 and "AD_TLVPERFIL" in r.json["erro"])
+chk("tabela inexistente 503", r.status_code==503 and "AD_PERFILTVL" in r.json["erro"])
 # token antigo (assinado com COBRANCA_SECRET) continua valendo
 del os.environ["AUTH_SECRET"]; os.environ["COBRANCA_SECRET"]="y"*40
 t2=auth.emitir_token(25,"RAFAEL"); chk("fallback COBRANCA_SECRET", auth.ler_token(t2)["codUsu"]==25)
