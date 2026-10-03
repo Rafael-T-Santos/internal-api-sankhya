@@ -5,6 +5,11 @@ nota, ligados pela TGFVAR), para conferir se a eliminação está certa.
 Só lê. Rodar no servidor:
 
     docker compose exec api-sankhya python scripts/conferir_ficha.py <CODPARC>
+
+Para achar um cliente que TENHA o caso pedido -> nota (e ver a eliminação de
+duplicados funcionando), sem depender de alguém conhecer um:
+
+    docker compose exec api-sankhya python scripts/conferir_ficha.py --achar
 """
 
 import os
@@ -26,6 +31,25 @@ SELECT N.NUNOTA, N.DTNEG, N.CODTIPOPER, N.VLRNOTA,
 """
 
 
+# Clientes com uma nota (nas TOPs) que nasceu de outra nota/pedido (também nas TOPs)
+# nos últimos 90 dias: exatamente o caso que a eliminação pela TGFVAR resolve.
+SQL_ACHAR = """
+SELECT * FROM (
+    SELECT ORIG.CODPARC, PAR.NOMEPARC, COUNT(DISTINCT ORIG.NUNOTA) AS CASOS
+      FROM TGFVAR VAR
+      JOIN TGFCAB ORIG  ON ORIG.NUNOTA = VAR.NUNOTAORIG
+      JOIN TGFCAB FILHA ON FILHA.NUNOTA = VAR.NUNOTA
+      JOIN TGFPAR PAR   ON PAR.CODPARC = ORIG.CODPARC
+     WHERE ORIG.CODEMP = :CODEMP
+       AND ORIG.CODTIPOPER IN ({tops})
+       AND FILHA.CODTIPOPER IN ({tops})
+       AND ORIG.DTNEG >= TRUNC(SYSDATE) - 90
+     GROUP BY ORIG.CODPARC, PAR.NOMEPARC
+     ORDER BY CASOS DESC
+) WHERE ROWNUM <= 10
+"""
+
+
 def brl(v):
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if v is not None else "—"
 
@@ -33,7 +57,8 @@ def brl(v):
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    codparc = int(sys.argv[1])
+    achar = sys.argv[1] == "--achar"
+    codparc = None if achar else int(sys.argv[1])
     pg = conectar_postgres()
     try:
         config = L.ler_configuracao(pg.cursor())
@@ -44,6 +69,19 @@ def main():
         sys.exit("Sem conexão com o Oracle.")
     try:
         cur = ora.cursor()
+        if achar:
+            tops, binds = F._binds_tops(config)
+            binds["CODEMP"] = config["codemp"]
+            cur.execute(SQL_ACHAR.replace("{tops}", tops), binds)
+            achados = cur.fetchall()
+            if not achados:
+                print("Nenhum cliente com pedido virando nota (dentro das TOPs) nos últimos 90 dias.")
+                print("Ou seja: hoje não há duplicidade para eliminar, e a regra não muda nenhum total.")
+            for cod, nome, casos in achados:
+                print(f"  {cod:>7}  {(nome or '').strip()[:45]:45}  {casos} pedido(s) que viraram nota")
+            if achados:
+                print(f"\nConfira um deles: python scripts/conferir_ficha.py {achados[0][0]}")
+            return
         tops, binds = F._binds_tops(config)
         binds.update({"CODEMP": config["codemp"], "CODPARC": codparc, "MESES": 12})
         cur.execute(SQL_TODAS.replace("{tops}", tops), binds)
