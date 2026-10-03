@@ -1285,6 +1285,26 @@ Exige perfil. Fila compartilhada: PJ, cliente, ativo, de AL e sem vendedor. Mesm
 
 Nas duas: grupo (matriz + filiais) com atraso acima de `ATRASO_MAX_DIAS` fica de fora; a última compra usa as TOPs marcadas em `televendas.top`; `503` se o Postgres não estiver configurado ou a configuração estiver vazia (rode `migrar.py`).
 
+#### `GET /api/televendas/clientes/{codParc}/compras?meses=12`
+
+Exige perfil. Notas dos últimos `meses` (1 a 36) nas TOPs de última compra, com série mensal (`serie`, meses sem compra = 0), `resumo` {`qtdNotas`, `valorTotal`, `ticketMedio`, `frequenciaDias` (média entre datas distintas de compra), `ultimaCompra`}.
+
+**Pedido + nota não contam duas vezes:** a lista de TOPs mistura pedidos e notas de venda, então uma nota que tem descendente nas mesmas TOPs (`TGFVAR.NUNOTAORIG`) é descartada e fica só o elo mais novo da cadeia. Devolução não é abatida e `STATUSNOTA` não é filtrado (igual às consultas do admin).
+
+#### `GET /api/televendas/clientes/{codParc}/mix`
+
+Exige perfil. Produtos dos últimos 180 dias (mesma eliminação de duplicados), os 20 mais frequentes, e `parouDeComprar`: comprado 2+ vezes na janela e sem comprar há 60+ dias.
+
+#### `GET /api/televendas/clientes/{codParc}/ultimo-pedido`
+
+Exige perfil. Itens da nota mais recente do cliente entre as TOPs de última compra (consulta `itens_ultimo_pedido` do admin, com TOPs e empresa da configuração). `{"pedido": null}` se nunca comprou.
+
+Para conferir os números de um cliente contra o Sankhya (lista as notas descartadas como duplicadas):
+
+```bash
+docker compose exec api-sankhya python scripts/conferir_ficha.py <CODPARC>
+```
+
 **Conferência contra a consulta original** (só lê; rode depois de carregar a escala, num dia útil):
 
 ```bash
@@ -1296,11 +1316,12 @@ docker compose exec -T api-sankhya python scripts/conferir_listas.py interna < ~
 
 ## Testes
 
-Três. Os dois em Python não precisam de banco; o da régua bate na API real.
+Quatro. Os três em Python não precisam de banco; o da régua bate na API real.
 
 ```bash
 python tests/test_sessao.py
 python tests/test_listas.py     # regra da escala, hora de saída da OC, montagem do SQL das listas
+python tests/test_ficha.py      # série, ticket, frequência e "parou de comprar" da ficha
 ```
 
 Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
