@@ -1,7 +1,10 @@
 ﻿# (Gravado em UTF-8 COM BOM: sem ele o PowerShell 5.1 lê como ANSI e o acento quebra as strings.)
 # Smoke test das ligações do televendas (Fase 3) contra a API REAL.
 #
-#   .\tests\smoke-televendas.ps1 -Usuario RAFAEL -Senha '****' -CodParc <cliente da FILA INTERNA>
+#   .\tests\smoke-televendas.ps1 -Usuario RAFAEL -CodParc <cliente da FILA INTERNA>
+#
+# -Usuario é o NOME de login do Sankhya (o da tela de login), não o código (CODUSU).
+# Sem -Senha, o script pergunta a senha sem mostrá-la na tela.
 #
 # Grava ligações de verdade no Postgres (schema televendas) para o cliente informado:
 # escolha um da fila interna que possa ser "sujado". No fim imprime o SQL de limpeza.
@@ -9,11 +12,15 @@
 # $_.ErrorDetails.Message (GetResponseStream volta vazio) — já tratado em Chamar.
 param(
     [Parameter(Mandatory = $true)][string]$Usuario,
-    [Parameter(Mandatory = $true)][string]$Senha,
+    [string]$Senha,
     [Parameter(Mandatory = $true)][int]$CodParc,
     [string]$Api = "http://192.168.255.6:5000"
 )
 $ErrorActionPreference = "Stop"
+if (-not $Senha) {
+    $seguro = Read-Host "Senha do Sankhya para $Usuario" -AsSecureString
+    $Senha = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($seguro))
+}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $falhas = 0
 $criadas = New-Object System.Collections.Generic.List[int]
@@ -41,9 +48,14 @@ function Conferir($nome, $cond, $detalhe = "") {
 # 1. Login e sessão
 $l = Chamar POST "/api/auth/login" @{ usuario = $Usuario; senha = $Senha } $null
 Conferir "login" ($l.status -eq 200) $l.status
+if ($l.status -ne 200) {
+    Write-Host "Login recusado ($($l.status) $($l.corpo.erro)). Confira -Usuario: é o NOME de login, não o código. Nada foi gravado." -ForegroundColor Red
+    exit 1
+}
 $script:token = $l.corpo.token
 $s = Chamar GET "/api/televendas/sessao"
 Conferir "sessão com perfil" ($s.status -eq 200 -and $s.corpo.perfil) "$($s.status) $($s.corpo.erro)"
+if ($s.status -ne 200) { Write-Host "Sem acesso ao televendas: confira a AD_PERFILTVL. Nada foi gravado." -ForegroundColor Red; exit 1 }
 Conferir "sem token = 401" ((Chamar POST "/api/televendas/chamadas/iniciar" @{ codParc = $CodParc; lista = "INTERNA" } "").status -eq 401)
 
 # 2. Corrida: dois /iniciar ao mesmo tempo, do mesmo operador, têm de resultar em UMA ligação.
@@ -62,6 +74,10 @@ Remove-Job $j1, $j2
 $ids = @($res | ForEach-Object { ($_ -split "\|", 2)[1] | ConvertFrom-Json } | ForEach-Object { $_.id } | Sort-Object -Unique)
 Conferir "corrida: os dois 201" (@($res | Where-Object { $_ -like "201|*" }).Count -eq 2) ($res -join " / ")
 Conferir "corrida: UMA ligação só (a 2ª é a mesma, 'retomada')" ($ids.Count -eq 1) ($ids -join ",")
+if ($ids.Count -lt 1 -or -not $ids[0]) {
+    Write-Host "Nenhuma ligação foi aberta (veja a resposta acima). Parando aqui." -ForegroundColor Red
+    exit 1
+}
 $id = [int]$ids[0]; $criadas.Add($id)
 $t = Chamar GET "/api/televendas/travas"
 Conferir "travas: cliente aparece uma vez" (@($t.corpo.dados | Where-Object { $_.codParc -eq $CodParc }).Count -eq 1)
@@ -84,7 +100,7 @@ Conferir "agenda traz o retorno de amanhã" (@($a.corpo.dados | Where-Object { $
 # 4. Descartar: idempotente, e descartada não se registra
 $n = Chamar POST "/api/televendas/chamadas/iniciar" @{ codParc = $CodParc; lista = "INTERNA" }
 Conferir "nova ligação depois da registrada = 201 (não retomada)" ($n.status -eq 201 -and -not $n.corpo.retomada)
-$id2 = [int]$n.corpo.id; $criadas.Add($id2)
+$id2 = [int]$n.corpo.id; if ($id2) { $criadas.Add($id2) }
 Conferir "cancelar = 200" ((Chamar POST "/api/televendas/chamadas/$id2/cancelar" @{}).status -eq 200)
 Conferir "cancelar de novo = 200 (idempotente)" ((Chamar POST "/api/televendas/chamadas/$id2/cancelar" @{}).status -eq 200)
 Conferir "registrar descartada = 409" ((Chamar PUT "/api/televendas/chamadas/$id2/finalizar" @{ resultado = "ATENDEU" }).status -eq 409)
@@ -92,5 +108,7 @@ Conferir "cancelar via ?token= (sendBeacon)" ((Chamar POST "/api/televendas/cham
 
 Write-Host ""
 if ($falhas) { Write-Host "$falhas FALHA(S)" -ForegroundColor Red } else { Write-Host "TUDO OK" -ForegroundColor Green }
-Write-Host "Limpeza (rodar no psql do servidor):"
-Write-Host "  DELETE FROM televendas.chamada WHERE id IN ($($criadas -join ', '));"
+if ($criadas.Count) {
+    Write-Host "Limpeza (no servidor):"
+    Write-Host "  docker exec check-my-load-db-1 psql -U checkmyload -d checkmyloaddb -c `"DELETE FROM televendas.chamada WHERE id IN ($($criadas -join ', '));`""
+}
