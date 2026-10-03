@@ -13,6 +13,7 @@ import cx_Oracle
 import psycopg2
 from flask import Blueprint, jsonify, request
 
+import televendas_ficha as ficha
 import televendas_listas as listas
 from auth import exige_operador
 from db import conectar_oracle
@@ -239,3 +240,56 @@ def lista_carteira():
 def lista_interna():
     """Fila interna: clientes PJ de AL sem vendedor, compartilhada por todos."""
     return _montar_lista("INTERNA")
+
+
+# ---------------------------------------------------------------------------
+# Ficha do cliente (Fase 2) — regra em televendas_ficha.py
+# ---------------------------------------------------------------------------
+
+
+def _ficha(codparc, montar):
+    """Lê a configuração no Postgres e roda `montar(cur_oracle, codparc, config)`."""
+    ora = pg = None
+    try:
+        pg = conectar_postgres()
+        config = listas.ler_configuracao(pg.cursor())
+        ora = conectar_oracle()
+        if not ora:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+        return jsonify({"sucesso": True, "codParc": codparc, **montar(ora.cursor(), codparc, config)})
+    except (PostgresNaoConfigurado, listas.ConfiguracaoIncompleta) as err:
+        return _erro(err, 503)
+    except psycopg2.Error as err:
+        return _erro(f"Erro no banco do televendas: {err}")
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    finally:
+        if ora:
+            ora.close()
+        if pg:
+            pg.close()
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/compras", methods=["GET"])
+@exige_televendas()
+def cliente_compras(codparc):
+    """Notas dos últimos `meses` (padrão 12, máx. 36), série mensal, ticket médio e frequência."""
+    try:
+        meses = min(max(int(request.args.get("meses", 12)), 1), 36)
+    except ValueError:
+        return jsonify({"erro": "meses inválido."}), 400
+    return _ficha(codparc, lambda cur, cod, cfg: ficha.compras(cur, cod, cfg, meses))
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/mix", methods=["GET"])
+@exige_televendas()
+def cliente_mix(codparc):
+    """Produtos dos últimos 6 meses e os que o cliente parou de comprar."""
+    return _ficha(codparc, ficha.mix)
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/ultimo-pedido", methods=["GET"])
+@exige_televendas()
+def cliente_ultimo_pedido(codparc):
+    """Itens da nota mais recente do cliente entre as TOPs de compra (consulta do admin)."""
+    return _ficha(codparc, ficha.ultimo_pedido)
