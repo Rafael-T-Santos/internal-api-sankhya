@@ -29,8 +29,10 @@ Cada endpoint abre sua própria conexão com o Oracle, executa uma query e devol
   - [CNPJ / situação do contribuinte](#cnpj--situação-do-contribuinte)
   - [Funcionários](#funcionários)
   - [Cobrança](#cobrança)
+  - [Autenticação (compartilhada)](#autenticação-compartilhada)
   - [Cobrança — operador](#cobrança--operador)
   - [Cobrança — régua de chamadas (escrita)](#cobrança--régua-de-chamadas-escrita)
+  - [Televendas](#televendas)
 - [Testes](#testes)
 - [Constantes hardcoded](#constantes-hardcoded)
 - [Tabelas do Sankhya usadas](#tabelas-do-sankhya-usadas)
@@ -93,11 +95,11 @@ Para a consulta de CNPJ ([`/api/consultar-cnpj`](#post-apiconsultar-cnpj)):
 
 > A cnpj.ws é **paga por consulta**. A rota valida o dígito verificador antes de chamar, então CNPJ digitado errado não gasta crédito. A consulta à SEFAZ/AL é pública e não precisa de credencial.
 
-Para a sessão do operador na régua de chamadas:
+Para a sessão do operador (cobrança e televendas — ver `auth.py`):
 
 | Variável | Descrição |
 |---|---|
-| `COBRANCA_SECRET` | Chave que assina os tokens de sessão. Qualquer string longa e aleatória — ex.: `python -c "import secrets;print(secrets.token_urlsafe(48))"` |
+| `AUTH_SECRET` | Chave que assina os tokens de sessão. Na ausência dela vale `COBRANCA_SECRET`, o nome antigo — o servidor que já tem `COBRANCA_SECRET` não precisa mudar nada (trocar o valor deslogaria todo mundo). Qualquer string longa e aleatória — ex.: `python -c "import secrets;print(secrets.token_urlsafe(48))"` |
 
 **Opcional, mas defina no servidor.** Sem ela cada processo sorteia o próprio segredo ao subir, e todo `docker compose up` desloga os operadores no meio do expediente.
 
@@ -938,9 +940,11 @@ Todos os títulos em aberto do cliente — **vencidos e a vencer**. Body: `{ "co
 
 ---
 
-### Cobrança — operador
+### Autenticação (compartilhada)
 
-#### `POST /api/cobranca/login`
+Login e sessão moram em `auth.py` e servem a cobrança e o televendas: **um token só**, aceito pelos dois. O token prova *quem* é o usuário; o *acesso* a cada app é decidido pelo próprio app (no televendas, pela `AD_TLVPERFIL`).
+
+#### `POST /api/auth/login`
 
 Autentica o operador e **abre a sessão**. Body: `{ "usuario": "<NOMEUSU>", "senha": "..." }`; `401` com credencial inválida.
 
@@ -952,6 +956,12 @@ Autentica o operador e **abre a sessão**. Body: `{ "usuario": "<NOMEUSU>", "sen
 **A senha não é conferida no Oracle.** Quem valida é o próprio Sankhya, pelo serviço `MobileLoginSP.login` chamado via Gateway (o hash da `TSIUSU` é proprietário e reproduzi-lo aqui seria frágil). Validada a senha, o `CODUSU` é resolvido na `TSIUSU` por `UPPER(NOMEUSU)`.
 
 O **token** é assinado com HMAC-SHA256 e carrega `codUsu`, `nomeUsu` e a expiração — não há tabela de sessão nem dicionário em memória. É ele que autoriza as rotas de escrita da régua (ver abaixo).
+
+#### `POST /api/cobranca/login`
+
+Alias de `POST /api/auth/login` — mesmo corpo, mesma resposta. Mantido porque o app da cobrança chama este caminho.
+
+### Cobrança — operador
 
 #### `GET /api/cobranca/operadores`
 
@@ -1216,11 +1226,38 @@ Aqui `situacao` **inclui `SEM_CONTATO`** — cliente com dívida e nenhuma chama
 
 As faixas do `aging` são as mesmas nas duas rotas (`<= 30`, `31-90`, `91-180`, `181-365`, `> 365` dias) e ficam escritas uma vez só no SQL: réguas diferentes fariam os dois gráficos discordarem sobre a mesma dívida.
 
+### Televendas
+
+Workspace de ligações do televendas (`televendas.py`). Plano completo no repositório do front: `televendas/docs/PLANO-TELEVENDAS.md`. Tabelas e regras **isoladas** das da cobrança.
+
+**Acesso:** o login é o compartilhado (`POST /api/auth/login`), mas só entra quem está **ativo** na `AD_TLVPERFIL` (`CODUSU`, `PERFIL` = `OPERADOR`|`GERENTE`, `ATIVO` = `S`|`N`). Perfil e vendedor são lidos do banco **a cada requisição**, não ficam no token: tirar o acesso vale na hora.
+
+**Vendedor do televendas:** `MIN(TGFVEN.CODVEND)` ativo com `TGFVEN.CODUSU` = usuário logado — a mesma regra da consulta da carteira do administrador do Sankhya. Reserva: `TSIUSU.CODVEND`.
+
+#### `GET /api/televendas/sessao`
+
+Exige token. Quem é o usuário no televendas — o app chama logo depois do login e a cada recarga.
+
+```jsonc
+{ "sucesso": true, "codUsu": 25, "nomeUsu": "RAFAEL",
+  "perfil": "OPERADOR", "codVend": 41, "apelidoVend": "ANA TLV" }
+```
+
+`codVend: null` = usuário sem vendedor (gerente sem carteira própria). `401` sem sessão; `403` sem perfil ativo (ou fora da gerência, nas rotas de gerente); `503` se a `AD_TLVPERFIL` ainda não existir no banco.
+
 ---
 
 ## Testes
 
-Um só, e cobre apenas a régua de chamadas — que é a única parte da API que **escreve** no banco por regra de negócio (trava de concorrência, cálculo da régua, transação).
+Dois. O de sessão não precisa de banco; o da régua bate na API real.
+
+```bash
+python tests/test_sessao.py
+```
+
+Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
+
+O smoke da régua cobre apenas a régua de chamadas — que é a única parte da cobrança que **escreve** no banco por regra de negócio (trava de concorrência, cálculo da régua, transação).
 
 ```powershell
 .\tests\smoke-chamadas.ps1                        # cliente 11107, operador 25
@@ -1275,9 +1312,9 @@ Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
 
 **Folha (`TFP*`):** `TFPFUN` (funcionários), `TFPCAR` (cargos), `TFPDEP` (setores/departamentos), `TFPCGH` (cargas horárias/jornadas), `TFPOCO` (ocorrências do funcionário) e `TFPHIS` (históricos de ocorrência, onde mora o código de afastamento).
 
-**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`.
+**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`; `AD_TLVPERFIL` (perfis de acesso do televendas).
 
-**Campos customizados em tabelas padrão:** `TGFCAB.AD_CODVENDINT` (vendedor interno da nota), usado pela cobrança como vendedor do título quando `TGFFIN.CODVEND` está vazio.
+**Campos customizados em tabelas padrão:** `TGFCAB.AD_CODVENDINT` (vendedor interno da nota), usado pela cobrança como vendedor do título quando `TGFFIN.CODVEND` está vazio. O televendas usa `TGFVEN.CODUSU` (usuário dono do vendedor) para achar o vendedor do operador.
 
 Também é usada a function `SNK_PRECO` no cálculo de ST.
 
@@ -1289,15 +1326,15 @@ Além do Oracle, as rotas [`/api/cadastrar-produto`](#post-apicadastrar-produto)
 
 Nada disso é bug novo — é o estado atual, documentado para quem for mexer:
 
-- **Sem autenticação, exceto na régua de chamadas.** As rotas de escrita da cobrança exigem token de sessão; todo o resto (inclusive `/api/cadastrar-produto` e `/api/registrar-contagem`, que gravam) segue aberto a qualquer um com acesso de rede. A API continua dependendo de estar em rede fechada.
-- **A sessão cai quando o container reinicia**, a menos que `COBRANCA_SECRET` esteja definida — sem ela, cada processo sorteia o próprio segredo na subida e os tokens antigos deixam de valer.
+- **Sem autenticação, exceto na régua de chamadas e no televendas.** As rotas de escrita da cobrança e as do televendas exigem token de sessão; todo o resto (inclusive `/api/cadastrar-produto` e `/api/registrar-contagem`, que gravam) segue aberto a qualquer um com acesso de rede. A API continua dependendo de estar em rede fechada.
+- **A sessão cai quando o container reinicia**, a menos que `AUTH_SECRET` (ou o nome antigo `COBRANCA_SECRET`) esteja definida — sem ela, cada processo sorteia o próprio segredo na subida e os tokens antigos deixam de valer.
 - **CORS liberado para qualquer origem** (`CORS(app)` sem restrição).
 - **Servidor de desenvolvimento.** O container roda `flask run`, não um WSGI de produção (gunicorn/waitress). Single-threaded e não recomendado para carga real.
 - **Uma conexão nova por request**, aberta e fechada a cada chamada — sem pool. Sob concorrência, isso vira gargalo no Oracle.
 - **Sem healthcheck** (`/health`) e sem logging estruturado — só `print()` para stdout.
 - **Sem paginação** em `/api/parceiros`, `/api/cidades`, `/api/vendedores`, `/api/funcionarios` e `/api/receitas-vencidas` sem filtro.
 - **O nome `/api/receitas-vencidas` mente, e o campo `situacao` também.** As condições `FIN.DTVENC < TRUNC(SYSDATE)` estão comentadas em `SELECT_RECEITAS` **de propósito**: a tela que consome este endpoint mostra títulos a vencer também, e usa os filtros de data para recortar o período. O endpoint devolve, portanto, todo título em aberto (hoje: 8.068 no total, sendo 1.246 vencidos e 6.822 a vencer). O problema real não é o filtro, é a nomenclatura — e principalmente o campo `situacao`, que rotula como `TÍTULO VENCIDO SEM PAGAMENTO` títulos que **ainda não venceram**. Isso é dado incorreto, não só nome ruim. Renomeação de endpoint/tela/rótulo está planejada.
-- **Quase sem testes.** Só a régua de chamadas tem cobertura ([tests/smoke-chamadas.ps1](#testes)); os outros 4 domínios não têm nenhuma.
+- **Quase sem testes.** Só a régua de chamadas ([tests/smoke-chamadas.ps1](#testes)) e o login/sessão ([tests/test_sessao.py](#testes)) têm cobertura; os outros 4 domínios não têm nenhuma.
 
 As queries usam bind variables em todos os endpoints, inclusive no SQL dinâmico de `/api/verificar-produto` — não há injeção de SQL.
 
