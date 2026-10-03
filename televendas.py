@@ -645,7 +645,15 @@ def motivos():
 @exige_televendas()
 def meu_dia():
     """Ligações de hoje e do mês do operador, contra a meta do mês."""
-    return _ligacao(lambda pg, ora: extras.meu_dia(pg, request.operador["codUsu"]))
+    def fazer(pg, ora):
+        r = extras.meu_dia(pg, request.operador["codUsu"])
+        nomes = tvconfig._nomes(ora, "SELECT CODPARC, NOMEPARC FROM TGFPAR WHERE CODPARC IN ({ids})",
+                                [x["codParc"] for x in r["ligacoesHoje"]])
+        for x in r["ligacoesHoje"]:
+            x["fantasia"] = (nomes.get(x["codParc"], (None,))[0] or "").strip() or None
+        return r
+
+    return _ligacao(fazer, precisa_oracle=True)
 
 
 @bp.route("/api/televendas/campanhas", methods=["GET"])
