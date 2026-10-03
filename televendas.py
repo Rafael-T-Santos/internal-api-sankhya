@@ -13,6 +13,7 @@ import cx_Oracle
 import psycopg2
 from flask import Blueprint, jsonify, request
 
+import televendas_config as tvconfig
 import televendas_ficha as ficha
 import televendas_listas as listas
 from auth import exige_operador
@@ -293,3 +294,144 @@ def cliente_mix(codparc):
 def cliente_ultimo_pedido(codparc):
     """Itens da nota mais recente do cliente entre as TOPs de compra (consulta do admin)."""
     return _ficha(codparc, ficha.ultimo_pedido)
+
+
+# ---------------------------------------------------------------------------
+# Configuração da gerência (Fase 2) — regra em televendas_config.py
+# ---------------------------------------------------------------------------
+
+
+def _config(fazer, codigo_ok=200):
+    """Abre Postgres (numa transação) e Oracle, roda `fazer(cur_pg, cur_ora, quem)`.
+
+    Erro de validação vira 400 e desfaz tudo o que a transação já tinha feito.
+    """
+    ora = pg = None
+    try:
+        pg = conectar_postgres()
+        ora = conectar_oracle()
+        if not ora:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+        quem = f"{request.operador['nomeUsu']} ({request.operador['codUsu']})"
+        with pg:  # commit no fim; rollback se qualquer coisa levantar
+            resultado = fazer(pg.cursor(), ora.cursor(), quem)
+        return jsonify({"sucesso": True, **resultado}), codigo_ok
+    except tvconfig.Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+    except PostgresNaoConfigurado as err:
+        return _erro(err, 503)
+    except psycopg2.Error as err:
+        return _erro(f"Erro no banco do televendas: {err}")
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    finally:
+        if ora:
+            ora.close()
+        if pg:
+            pg.close()
+
+
+def _corpo():
+    return request.get_json(silent=True) or {}
+
+
+@bp.route("/api/televendas/config/escala", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_escala():
+    """Linhas da escala com nomes de representante, cidade e bairro."""
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.listar_escala(pg, ora)})
+
+
+@bp.route("/api/televendas/config/escala", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_escala_criar():
+    """{codVend, diaVisita 1-5, tipoLocal C|B, codCid | codBai} -> 201 {id}."""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": tvconfig.criar_escala(pg, ora, corpo, quem)}, 201)
+
+
+@bp.route("/api/televendas/config/escala/<int:id_>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_escala_alterar(id_):
+    """{diaVisita?, ativo?}. Desativar em vez de apagar: o histórico de quem mexeu fica."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        if not tvconfig.alterar_escala(pg, id_, corpo, quem):
+            raise tvconfig.Invalido(f"Linha {id_} da escala não existe.")
+        return {}
+
+    return _config(fazer)
+
+
+@bp.route("/api/televendas/config/representantes", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_representantes():
+    """Representantes externos ligados a algum televendas (TGFVEN.AD_CODVEND)."""
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.representantes(ora)})
+
+
+@bp.route("/api/televendas/config/locais", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_locais():
+    """?tipo=C|B&q=texto -> até 30 cidades de AL (C) ou bairros (B) pelo nome."""
+    tipo = request.args.get("tipo", "C")
+    if tipo not in ("C", "B"):
+        return jsonify({"erro": "tipo é C ou B."}), 400
+    q = request.args.get("q")
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.buscar_local(ora, tipo, q)})
+
+
+@bp.route("/api/televendas/config/tops", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_tops():
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.listar_tops(pg, ora)})
+
+
+@bp.route("/api/televendas/config/tops", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_tops_criar():
+    """{codTipOper, conversao?, ultimaCompra?}: só TOP que existe no Sankhya."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        cod = tvconfig._int(corpo, "codTipOper")
+        tvconfig.salvar_top(pg, ora, cod, corpo, quem, criar=True)
+        return {"codTipOper": cod}
+
+    return _config(fazer, 201)
+
+
+@bp.route("/api/televendas/config/tops/<int:cod>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_tops_alterar(cod):
+    """{conversao?, ultimaCompra?, ativo?}. Recusa deixar as listas sem TOP de última compra."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        if not tvconfig.salvar_top(pg, ora, cod, corpo, quem):
+            raise tvconfig.Invalido(f"A TOP {cod} não está cadastrada.")
+        tvconfig.checar_tops_minimas(pg)
+        return {}
+
+    return _config(fazer)
+
+
+@bp.route("/api/televendas/config/parametros", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_parametros():
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.listar_parametros(pg)})
+
+
+@bp.route("/api/televendas/config/parametros/<chave>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_parametros_alterar(chave):
+    """{valor}: só as chaves e faixas de televendas_config.PARAMETROS."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        if not tvconfig.salvar_parametro(pg, chave, corpo, quem):
+            raise tvconfig.Invalido(f"Parâmetro '{chave}' não existe.")
+        return {}
+
+    return _config(fazer)

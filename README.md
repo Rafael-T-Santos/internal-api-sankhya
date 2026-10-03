@@ -1305,6 +1305,20 @@ Para conferir os números de um cliente contra o Sankhya (lista as notas descart
 docker compose exec api-sankhya python scripts/conferir_ficha.py <CODPARC>
 ```
 
+#### Configuração da gerência — `/api/televendas/config/*`
+
+Só `GERENTE` (o perfil é lido da `AD_PERFILTVL` a cada requisição; operador recebe `403`). Toda escrita valida o código contra o Sankhya, roda numa transação (erro = `400` e nada gravado) e grava `alterado_por`/`alterado_em`.
+
+| Rota | Faz |
+|---|---|
+| `GET /config/escala` | Linhas da escala com nome do representante, cidade/UF ou bairro |
+| `POST /config/escala` | `{codVend, diaVisita 1-5, tipoLocal C\|B, codCid \| codBai}`. Recusa local repetido para o mesmo representante |
+| `PUT /config/escala/{id}` | `{diaVisita?, ativo?}`. Desativa em vez de apagar |
+| `GET /config/representantes` | Vendedores com `AD_CODVEND` (os externos ligados a um televendas) |
+| `GET /config/locais?tipo=C\|B&q=` | Até 30 cidades de AL ou bairros pelo nome |
+| `GET /config/tops`, `POST /config/tops`, `PUT /config/tops/{cod}` | Papéis de cada TOP (`conversao` ORCAMENTO/PEDIDO, `ultimaCompra`, `ativo`). Recusa deixar nenhuma TOP de última compra ativa (as listas parariam) |
+| `GET /config/parametros`, `PUT /config/parametros/{chave}` | `{valor}` inteiro, só para JANELA_ATRIBUICAO_DIAS (0–30), ATRASO_MAX_DIAS (0–365), TRAVA_MINUTOS (5–120), CODEMP |
+
 **Conferência contra a consulta original** (só lê; rode depois de carregar a escala, num dia útil):
 
 ```bash
@@ -1316,12 +1330,13 @@ docker compose exec -T api-sankhya python scripts/conferir_listas.py interna < ~
 
 ## Testes
 
-Quatro. Os três em Python não precisam de banco; o da régua bate na API real.
+Cinco. Os quatro em Python não precisam de banco; o da régua bate na API real.
 
 ```bash
 python tests/test_sessao.py
 python tests/test_listas.py     # regra da escala, hora de saída da OC, montagem do SQL das listas
 python tests/test_ficha.py      # série, ticket, frequência e "parou de comprar" da ficha
+python tests/test_config.py     # rotas da gerência: 403 para operador, validações, rollback, auditoria
 ```
 
 Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
