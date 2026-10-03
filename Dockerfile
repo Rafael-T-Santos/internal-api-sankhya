@@ -21,6 +21,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia o código da sua API (app.py + db.py + módulos por domínio, ex.: cobranca.py)
 COPY *.py ./
 
+# Migrações e scripts de manutenção do televendas (rodam com `docker compose exec`).
+COPY migrations ./migrations
+COPY scripts ./scripts
+
 # Expõe a porta 5000 (padrão do Flask)
 EXPOSE 5000
 

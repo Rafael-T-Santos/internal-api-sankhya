@@ -95,6 +95,16 @@ Para a consulta de CNPJ ([`/api/consultar-cnpj`](#post-apiconsultar-cnpj)):
 
 > A cnpj.ws é **paga por consulta**. A rota valida o dígito verificador antes de chamar, então CNPJ digitado errado não gasta crédito. A consulta à SEFAZ/AL é pública e não precisa de credencial.
 
+Para o banco do televendas (Postgres, schema `televendas` — ver `pg.py`):
+
+| Variável | Descrição |
+|---|---|
+| `PG_HOST` / `PG_PORT` | `192.168.255.6` / `5432` (o Postgres do check-my-load, pela porta do host) |
+| `PG_DB` | `checkmyloaddb` |
+| `PG_USER` / `PG_PASS` | `televendas` / a senha criada no servidor (nunca em repositório) |
+
+Sem elas, só as rotas do televendas que usam o Postgres respondem `503`; o resto da API segue normal.
+
 Para a sessão do operador (cobrança e televendas — ver `auth.py`):
 
 | Variável | Descrição |
@@ -1245,14 +1255,52 @@ Exige token. Quem é o usuário no televendas — o app chama logo depois do log
 
 `codVend: null` = usuário sem vendedor (gerente sem carteira própria). `401` sem sessão; `403` sem perfil ativo (ou fora da gerência, nas rotas de gerente); `503` se a `AD_PERFILTVL` ainda não existir no banco.
 
+**Banco próprio:** tudo o que é do televendas (ligações, escala, TOPs, parâmetros, metas, campanhas) mora no **Postgres**, schema `televendas`, no Postgres do check-my-load (`pg.py`). No Sankhya fica só a `AD_PERFILTVL`. Tabelas criadas por migrações em `migrations/televendas/`, aplicadas com:
+
+```bash
+docker compose exec api-sankhya python scripts/migrar.py            # aplica as pendentes
+docker compose exec api-sankhya python scripts/carregar_escala.py   # carga inicial da escala (mostra; --aplicar grava)
+```
+
+#### `GET /api/televendas/listas/carteira`
+
+Exige perfil. Clientes dos representantes externos cujo `TGFVEN.AD_CODVEND` é o televendas logado (consulta do admin do Sankhya, adaptada: ver `televendas_listas.py`). Por padrão só os **liberados pela escala hoje**; `?completa=1` traz todos, cada um com `rota.liberado` (só para ver: ligar para não liberado é recusado). `?codTelevend=<n>` abre a carteira de outro televendas — só `GERENTE`.
+
+```jsonc
+{ "sucesso": true, "lista": "CARTEIRA", "hoje": "2026-10-07", "diaSemana": 3,
+  "totalCarteira": 60, "aguardandoRota": 18, "totalRegistros": 42,
+  "dados": [ { "codParc": 11842, "fantasia": "…", "cidade": "PENEDO", "bairro": "CENTRO",
+               "codVendExterno": 2, "vendedor": "JOÃO", "ultimaCompra": "2026-09-19", "diasSemCompra": 18,
+               "diasAtraso": 0, "vlrAtrasado": 0, "ultimaOrdemCarga": 48213, "dataOrdemCarga": "2026-09-19",
+               "horaSaidaOrdem": "07:40",
+               "contatos": [ { "codContato": 1, "nome": "MARCOS", "telefone": null, "celular": "82998124410", "email": null } ],
+               "rota": { "diaVisita": 2, "diaVisitaDesc": "TER", "liberado": true, "liberaEm": "quarta" },
+               "televendas": { "ultimoContato": { "em": "…", "nomeUsu": "ANA", "resultado": "NAO_ATENDEU", "desfecho": null },
+                               "contatosHoje": 1, "retornoEm": null, "emChamada": null } } ] }
+```
+
+#### `GET /api/televendas/listas/interna`
+
+Exige perfil. Fila compartilhada: PJ, cliente, ativo, de AL e sem vendedor. Mesmo formato, sem `rota`.
+
+Nas duas: grupo (matriz + filiais) com atraso acima de `ATRASO_MAX_DIAS` fica de fora; a última compra usa as TOPs marcadas em `televendas.top`; `503` se o Postgres não estiver configurado ou a configuração estiver vazia (rode `migrar.py`).
+
+**Conferência contra a consulta original** (só lê; rode depois de carregar a escala, num dia útil):
+
+```bash
+docker compose exec -T api-sankhya python scripts/conferir_listas.py carteira <CODVEND do televendas> < ~/televendas/docs/carteira_televendas_representantes.txt
+docker compose exec -T api-sankhya python scripts/conferir_listas.py interna < ~/televendas/docs/clientes_televendas_geral.txt
+```
+
 ---
 
 ## Testes
 
-Dois. O de sessão não precisa de banco; o da régua bate na API real.
+Três. Os dois em Python não precisam de banco; o da régua bate na API real.
 
 ```bash
 python tests/test_sessao.py
+python tests/test_listas.py     # regra da escala, hora de saída da OC, montagem do SQL das listas
 ```
 
 Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
