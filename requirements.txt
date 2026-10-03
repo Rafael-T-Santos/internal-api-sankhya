@@ -2,6 +2,8 @@ Flask==2.3.3
 flask-cors==4.0.0
 cx_Oracle==8.3.0
 requests==2.31.0
+# Postgres do televendas (pg.py). -binary: não precisa de compilador nem libpq na imagem.
+psycopg2-binary==2.9.9
 # Envio dos anexos de cobrança para o Google Drive (drive.py).
 # google-auth-oauthlib NÃO entra aqui: ela só é usada na autorização única,
 # rodada à mão na máquina do dev (scripts/autorizar-drive.py).

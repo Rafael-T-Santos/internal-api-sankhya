@@ -10,10 +10,13 @@ gerência mantém. Tabelas e regras deste módulo são isoladas das da cobrança
 from functools import wraps
 
 import cx_Oracle
+import psycopg2
 from flask import Blueprint, jsonify, request
 
+import televendas_listas as listas
 from auth import exige_operador
 from db import conectar_oracle
+from pg import PostgresNaoConfigurado, conectar_postgres
 
 bp = Blueprint("televendas", __name__)
 
@@ -149,3 +152,90 @@ def sessao():
             **request.televendas,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Listas (Fase 2) — regra em televendas_listas.py
+# ---------------------------------------------------------------------------
+
+
+def _montar_lista(lista, codtelevend=None, completa=False):
+    """Oracle (clientes) + Postgres (escala, configuração e contatos do televendas)."""
+    ora = pg = None
+    try:
+        pg = conectar_postgres()
+        ora = conectar_oracle()
+        if not ora:
+            return jsonify({"erro": "Falha na conexão com o banco"}), 500
+        cur_pg = pg.cursor()
+        cur_ora = ora.cursor()
+
+        config = listas.ler_configuracao(cur_pg)
+        hoje, dia_semana, clientes = listas.buscar_clientes(cur_ora, lista, config, codtelevend)
+        listas.anexar_contatos(cur_ora, clientes)
+
+        total, aguardando = len(clientes), 0
+        if lista == "CARTEIRA":
+            escala = listas.ler_escala(cur_pg, {c["codVendExterno"] for c in clientes})
+            listas.anexar_rota(clientes, escala, dia_semana)
+            aguardando = sum(1 for c in clientes if not c["rota"]["liberado"])
+            if not completa:
+                clientes = [c for c in clientes if c["rota"]["liberado"]]
+
+        listas.anexar_contatos_televendas(cur_pg, clientes)
+        return jsonify(
+            {
+                "sucesso": True,
+                "lista": lista,
+                "hoje": hoje.isoformat(),
+                "diaSemana": dia_semana,
+                "totalCarteira": total,
+                "aguardandoRota": aguardando,
+                "totalRegistros": len(clientes),
+                "dados": clientes,
+            }
+        )
+    except PostgresNaoConfigurado as err:
+        return _erro(err, 503)
+    except listas.ConfiguracaoIncompleta as err:
+        return _erro(err, 503)
+    except psycopg2.Error as err:
+        return _erro(f"Erro no banco do televendas: {err}")
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    finally:
+        if ora:
+            ora.close()
+        if pg:
+            pg.close()
+
+
+@bp.route("/api/televendas/listas/carteira", methods=["GET"])
+@exige_televendas()
+def lista_carteira():
+    """Minha carteira: clientes dos representantes externos ligados ao televendas.
+
+    Query: completa=1 (também os que a escala ainda não liberou — só para ver;
+    o /iniciar recusa ligar para eles), codTelevend=<n> (só GERENTE: a carteira
+    de outro televendas). Cada cliente traz `rota` {diaVisita, liberado, liberaEm}.
+    """
+    ctx = request.televendas
+    codtelevend = ctx["codVend"]
+    pedido = request.args.get("codTelevend")
+    if pedido:
+        if ctx["perfil"] != "GERENTE":
+            return jsonify({"erro": "Só a gerência abre a carteira de outro televendas."}), 403
+        try:
+            codtelevend = int(pedido)
+        except ValueError:
+            return jsonify({"erro": "codTelevend inválido."}), 400
+    if not codtelevend:
+        return jsonify({"erro": "Seu usuário não tem vendedor vinculado, então não tem carteira própria."}), 400
+    return _montar_lista("CARTEIRA", codtelevend, completa=request.args.get("completa") == "1")
+
+
+@bp.route("/api/televendas/listas/interna", methods=["GET"])
+@exige_televendas()
+def lista_interna():
+    """Fila interna: clientes PJ de AL sem vendedor, compartilhada por todos."""
+    return _montar_lista("INTERNA")
