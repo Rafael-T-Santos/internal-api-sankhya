@@ -18,7 +18,7 @@ import televendas_listas as L  # noqa: E402
 from db import conectar_oracle  # noqa: E402
 from pg import conectar_postgres  # noqa: E402
 
-SQL_TODAS = "WITH" + F._NOTAS_EFETIVAS + """
+SQL_TODAS = "WITH" + F._NOTAS_EFETIVAS.replace("{inicio}", F.INICIO_MESES) + """
 SELECT N.NUNOTA, N.DTNEG, N.CODTIPOPER, N.VLRNOTA,
        CASE WHEN N.NUNOTA IN (SELECT NUNOTA FROM NOTAS_EFETIVAS) THEN 'conta' ELSE 'DESCARTADA' END
   FROM NOTAS N
@@ -45,7 +45,7 @@ def main():
     try:
         cur = ora.cursor()
         tops, binds = F._binds_tops(config)
-        binds.update({"CODEMP": config["codemp"], "CODPARC": codparc, "DIAS": 12 * 31})
+        binds.update({"CODEMP": config["codemp"], "CODPARC": codparc, "MESES": 12})
         cur.execute(SQL_TODAS.replace("{tops}", tops), binds)
         print(f"\nNOTAS DOS ÚLTIMOS 12 MESES (TOPs {config['tops']}):")
         notas = cur.fetchall()

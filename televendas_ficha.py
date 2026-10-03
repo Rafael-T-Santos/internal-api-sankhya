@@ -32,7 +32,7 @@ NOTAS AS
      WHERE CAB.CODEMP = :CODEMP
        AND CAB.CODPARC = :CODPARC
        AND CAB.CODTIPOPER IN ({tops})
-       AND CAB.DTNEG >= TRUNC(SYSDATE) - :DIAS
+       AND CAB.DTNEG >= {inicio}
 ),
 NOTAS_EFETIVAS AS
 (
@@ -47,9 +47,15 @@ NOTAS_EFETIVAS AS
            )
 )"""
 
+# Compras: os últimos N meses DO CALENDÁRIO (do dia 1º do mês mais antigo até hoje),
+# a mesma janela da série mensal. Uma janela em dias ("372 dias") pegava notas de
+# um 13º mês que entravam no total e no ticket sem aparecer em nenhuma coluna.
+INICIO_MESES = "TRUNC(ADD_MONTHS(TRUNC(SYSDATE), 1 - :MESES), 'MM')"
+INICIO_DIAS = "TRUNC(SYSDATE) - :DIAS"
+
 SQL_COMPRAS = (
     "WITH"
-    + _NOTAS_EFETIVAS
+    + _NOTAS_EFETIVAS.replace("{inicio}", INICIO_MESES)
     + """
 SELECT N.NUNOTA, N.NUMNOTA, N.DTNEG, N.CODTIPOPER, TOP.DESCROPER, N.VLRNOTA,
        VEN.APELIDO AS VENDEDOR, VINT.APELIDO AS VENDEDOR_INTERNO
@@ -63,7 +69,7 @@ SELECT N.NUNOTA, N.NUMNOTA, N.DTNEG, N.CODTIPOPER, TOP.DESCROPER, N.VLRNOTA,
 
 SQL_MIX = (
     "WITH"
-    + _NOTAS_EFETIVAS
+    + _NOTAS_EFETIVAS.replace("{inicio}", INICIO_DIAS)
     + """
 SELECT ITE.CODPROD, PRO.DESCRPROD, PRO.CODVOL, PRO.MARCA,
        SUM(ITE.QTDNEG) AS QTD,
@@ -135,7 +141,7 @@ def _num(v):
 def compras(cur, codparc, config, meses=12):
     """Notas efetivas dos últimos `meses`, série mensal, ticket médio e frequência."""
     tops, binds = _binds_tops(config)
-    binds.update({"CODEMP": config["codemp"], "CODPARC": codparc, "DIAS": meses * 31})
+    binds.update({"CODEMP": config["codemp"], "CODPARC": codparc, "MESES": meses})
     cur.execute(SQL_COMPRAS.replace("{tops}", tops), binds)
     notas = []
     for r in cur.fetchall():
