@@ -942,7 +942,7 @@ Todos os títulos em aberto do cliente — **vencidos e a vencer**. Body: `{ "co
 
 ### Autenticação (compartilhada)
 
-Login e sessão moram em `auth.py` e servem a cobrança e o televendas: **um token só**, aceito pelos dois. O token prova *quem* é o usuário; o *acesso* a cada app é decidido pelo próprio app (no televendas, pela `AD_TLVPERFIL`).
+Login e sessão moram em `auth.py` e servem a cobrança e o televendas: **um token só**, aceito pelos dois. O token prova *quem* é o usuário; o *acesso* a cada app é decidido pelo próprio app (no televendas, pela `AD_PERFILTVL`).
 
 #### `POST /api/auth/login`
 
@@ -1230,7 +1230,7 @@ As faixas do `aging` são as mesmas nas duas rotas (`<= 30`, `31-90`, `91-180`, 
 
 Workspace de ligações do televendas (`televendas.py`). Plano completo no repositório do front: `televendas/docs/PLANO-TELEVENDAS.md`. Tabelas e regras **isoladas** das da cobrança.
 
-**Acesso:** o login é o compartilhado (`POST /api/auth/login`), mas só entra quem está **ativo** na `AD_TLVPERFIL` (`CODUSU`, `PERFIL` = `OPERADOR`|`GERENTE`, `ATIVO` = `S`|`N`). Perfil e vendedor são lidos do banco **a cada requisição**, não ficam no token: tirar o acesso vale na hora.
+**Acesso:** o login é o compartilhado (`POST /api/auth/login`), mas só entra quem está **ativo** na `AD_PERFILTVL` (`CODUSU`, `PERFIL` = `OPERADOR`|`GERENTE`, `ATIVO` = `S`|`N`). Perfil e vendedor são lidos do banco **a cada requisição**, não ficam no token: tirar o acesso vale na hora.
 
 **Vendedor do televendas:** `MIN(TGFVEN.CODVEND)` ativo com `TGFVEN.CODUSU` = usuário logado — a mesma regra da consulta da carteira do administrador do Sankhya. Reserva: `TSIUSU.CODVEND`.
 
@@ -1243,7 +1243,7 @@ Exige token. Quem é o usuário no televendas — o app chama logo depois do log
   "perfil": "OPERADOR", "codVend": 41, "apelidoVend": "ANA TLV" }
 ```
 
-`codVend: null` = usuário sem vendedor (gerente sem carteira própria). `401` sem sessão; `403` sem perfil ativo (ou fora da gerência, nas rotas de gerente); `503` se a `AD_TLVPERFIL` ainda não existir no banco.
+`codVend: null` = usuário sem vendedor (gerente sem carteira própria). `401` sem sessão; `403` sem perfil ativo (ou fora da gerência, nas rotas de gerente); `503` se a `AD_PERFILTVL` ainda não existir no banco.
 
 ---
 
@@ -1312,7 +1312,7 @@ Na cobrança entram ainda `TGFCHQ` (cheques) e `TSIUSU` (usuários/operadores).
 
 **Folha (`TFP*`):** `TFPFUN` (funcionários), `TFPCAR` (cargos), `TFPDEP` (setores/departamentos), `TFPCGH` (cargas horárias/jornadas), `TFPOCO` (ocorrências do funcionário) e `TFPHIS` (históricos de ocorrência, onde mora o código de afastamento).
 
-**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`; `AD_TLVPERFIL` (perfis de acesso do televendas).
+**Customizadas (AD\_):** `AD_CONTAGEMMARCA` e `AD_CONTAGEMMARCAITE` (contagem de estoque por marca); `AD_CONF_ENT_CAB` e `AD_CONF_ENT_ITE` (conferência de entrada), com a sequence `AD_SEQ_CONF_ENT`; `AD_COBRCHAMADA`, `AD_COBRCHAMADAITEM` e `AD_COBRANEXO` (régua de chamadas), com as sequences `SEQ_AD_COBRCHAMADA`, `SEQ_AD_COBRCHAMADAITEM` e `SEQ_AD_COBRANEXO`; `AD_PERFILTVL` (perfis de acesso do televendas).
 
 **Campos customizados em tabelas padrão:** `TGFCAB.AD_CODVENDINT` (vendedor interno da nota), usado pela cobrança como vendedor do título quando `TGFFIN.CODVEND` está vazio. O televendas usa `TGFVEN.CODUSU` (usuário dono do vendedor) para achar o vendedor do operador.
 

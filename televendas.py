@@ -3,7 +3,7 @@
 Plano completo no repositório do front: televendas/docs/PLANO-TELEVENDAS.md.
 
 O login é o mesmo da cobrança (auth.py). Estar autenticado, porém, não dá
-acesso ao televendas: o usuário precisa estar ATIVO na AD_TLVPERFIL, que a
+acesso ao televendas: o usuário precisa estar ATIVO na AD_PERFILTVL, que a
 gerência mantém. Tabelas e regras deste módulo são isoladas das da cobrança.
 """
 
@@ -62,7 +62,7 @@ SQL_VENDEDOR = """
 
 SQL_PERFIL = """
     SELECT UPPER(TRIM(P.PERFIL)), NVL(P.ATIVO, 'N')
-      FROM AD_TLVPERFIL P
+      FROM AD_PERFILTVL P
      WHERE P.CODUSU = :CODUSU
 """
 
@@ -88,10 +88,10 @@ def _contexto(cursor, cod_usu):
 
 
 def _resposta_banco(err):
-    """ORA-00942 aqui quase sempre é a AD_TLVPERFIL que ainda não foi criada."""
+    """ORA-00942 aqui quase sempre é a AD_PERFILTVL que ainda não foi criada."""
     if "ORA-00942" in str(err):
         return _erro(
-            "Tabela de perfis do televendas (AD_TLVPERFIL) não encontrada no banco.", 503
+            "Tabela de perfis do televendas (AD_PERFILTVL) não encontrada no banco.", 503
         )
     return _erro(f"Erro de Banco de Dados: {err}")
 
@@ -139,7 +139,7 @@ def sessao():
 
     200: { sucesso, codUsu, nomeUsu, perfil: "OPERADOR"|"GERENTE",
            codVend, apelidoVend }   codVend nulo = sem carteira própria.
-    401: sem sessão.  403: sem perfil ativo.  503: AD_TLVPERFIL não existe.
+    401: sem sessão.  403: sem perfil ativo.  503: AD_PERFILTVL não existe.
     """
     return jsonify(
         {
