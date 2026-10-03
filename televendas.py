@@ -18,6 +18,7 @@ from werkzeug.utils import secure_filename
 import drive
 import televendas_chamadas as chamadas
 import televendas_config as tvconfig
+import televendas_extras as extras
 import televendas_ficha as ficha
 import televendas_listas as listas
 from auth import exige_operador
@@ -633,3 +634,103 @@ def travas():
 def motivos():
     """Motivos de não compra ativos, para o formulário da ligação."""
     return _ligacao(lambda pg, ora: {"dados": chamadas.motivos(pg)})
+
+
+# ---------------------------------------------------------------------------
+# Fase 5: metas, Meu dia, campanhas e roteiros — regra em televendas_extras.py
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/api/televendas/meu-dia", methods=["GET"])
+@exige_televendas()
+def meu_dia():
+    """Ligações de hoje e do mês do operador, contra a meta do mês."""
+    return _ligacao(lambda pg, ora: extras.meu_dia(pg, request.operador["codUsu"]))
+
+
+@bp.route("/api/televendas/campanhas", methods=["GET"])
+@exige_televendas()
+def campanhas_vigentes():
+    """?lista=CARTEIRA|INTERNA: campanhas ativas e dentro da vigência, com os produtos."""
+    lista = request.args.get("lista")
+    return _ligacao(lambda pg, ora: {"dados": extras.listar_campanhas(pg, ora, so_vigentes=True, lista=lista)}, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/roteiros", methods=["GET"])
+@exige_televendas()
+def roteiros_ativos():
+    """?lista=CARTEIRA|INTERNA: roteiros ativos da lista (e os de AMBAS)."""
+    lista = request.args.get("lista")
+    return _ligacao(lambda pg, ora: {"dados": extras.listar_roteiros(pg, so_ativos=True, lista=lista)})
+
+
+@bp.route("/api/televendas/config/metas", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_metas():
+    """?competencia=AAAAMM: uma linha por usuário com perfil ativo, com a meta do mês."""
+    comp = request.args.get("competencia") or date.today().strftime("%Y%m")
+    return _config(lambda pg, ora, quem: {"competencia": comp, "dados": extras.listar_metas(pg, ora, comp)})
+
+
+@bp.route("/api/televendas/config/metas", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_metas_salvar():
+    """{codUsu, competencia, ligacoesDia?, valorVenda?, positivacao?}: cria ou substitui."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        extras.salvar_meta(pg, corpo)
+        return {}
+
+    return _config(fazer)
+
+
+@bp.route("/api/televendas/config/campanhas", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_campanhas():
+    return _config(lambda pg, ora, quem: {"dados": extras.listar_campanhas(pg, ora)})
+
+
+@bp.route("/api/televendas/config/campanhas", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_campanhas_criar():
+    """{titulo, texto?, inicio, fim, lista CARTEIRA|INTERNA|AMBAS, produtos?: [codprod], ativo?}"""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": extras.salvar_campanha(pg, ora, corpo)}, 201)
+
+
+@bp.route("/api/televendas/config/campanhas/<int:id_>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_campanhas_alterar(id_):
+    """Mesmo corpo do POST; a lista de produtos enviada SUBSTITUI a anterior."""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": extras.salvar_campanha(pg, ora, corpo, id_)})
+
+
+@bp.route("/api/televendas/config/produtos", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_produtos():
+    """?q=texto ou código: até 20 produtos ativos (para montar a campanha)."""
+    q = request.args.get("q")
+    return _config(lambda pg, ora, quem: {"dados": extras.buscar_produtos(ora, q)})
+
+
+@bp.route("/api/televendas/config/roteiros", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_roteiros():
+    return _config(lambda pg, ora, quem: {"dados": extras.listar_roteiros(pg)})
+
+
+@bp.route("/api/televendas/config/roteiros", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_roteiros_criar():
+    """{titulo, texto, lista?, campanhaId?, ativo?}"""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": extras.salvar_roteiro(pg, corpo)}, 201)
+
+
+@bp.route("/api/televendas/config/roteiros/<int:id_>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_roteiros_alterar(id_):
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": extras.salvar_roteiro(pg, corpo, id_)})

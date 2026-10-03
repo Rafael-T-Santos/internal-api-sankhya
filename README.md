@@ -1339,6 +1339,18 @@ A trava serializa por cliente com `pg_advisory_xact_lock(7001, codparc)` — o e
 
 Motivos de não compra (só gerente): `GET/POST /config/motivos`, `PUT /config/motivos/{id}` (`{descricao?, ordem?, ativo?}`).
 
+#### Metas, Meu dia, campanhas e roteiros (Fase 5) — `televendas_extras.py`
+
+| Rota | Quem | Faz |
+|---|---|---|
+| `GET /meu-dia` | perfil | Ligações, atendidas, vendas e orçamentos de hoje e do mês, clientes com venda no mês e a meta do mês. `valorVendido` é `null` até a Fase 4 |
+| `GET /campanhas?lista=` | perfil | Campanhas ativas e vigentes da lista (e as de AMBAS), com produtos |
+| `GET /roteiros?lista=` | perfil | Roteiros ativos da lista |
+| `GET /config/metas?competencia=AAAAMM`, `PUT /config/metas` | gerente | Uma linha por usuário ativo na `AD_PERFILTVL`; `{codUsu, competencia, ligacoesDia?, valorVenda?, positivacao?}` cria ou substitui |
+| `GET/POST /config/campanhas`, `PUT /config/campanhas/{id}` | gerente | `{titulo, texto?, inicio, fim, lista, produtos?: [codprod], ativo?}`; produtos validados na TGFPRO; a lista enviada substitui a anterior |
+| `GET /config/produtos?q=` | gerente | Até 20 produtos ativos por nome ou código |
+| `GET/POST /config/roteiros`, `PUT /config/roteiros/{id}` | gerente | `{titulo, texto, lista?, campanhaId?, ativo?}` |
+
 #### Rotinas do servidor (cron do host)
 
 | Rotina | Quando | O quê |
@@ -1361,7 +1373,7 @@ docker compose exec -T api-sankhya python scripts/conferir_listas.py interna < ~
 
 ## Testes
 
-Seis em Python, sem banco, e dois smoke tests contra a API real; o da régua bate na API real.
+Sete em Python, sem banco, e dois smoke tests contra a API real; o da régua bate na API real.
 
 ```bash
 python tests/test_sessao.py
@@ -1369,6 +1381,7 @@ python tests/test_listas.py     # regra da escala, hora de saída da OC, montage
 python tests/test_ficha.py      # série, ticket, frequência e "parou de comprar" da ficha
 python tests/test_config.py     # rotas da gerência: 403 para operador, validações, rollback, auditoria
 python tests/test_chamadas.py   # regras do registro: resultado obrigatório, NUNOTA do cliente, 409, idempotência
+python tests/test_extras.py     # validações de metas, campanhas e roteiros
 ```
 
 Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
