@@ -317,3 +317,41 @@ def salvar_parametro(cur_pg, chave, dados, quem):
         (str(valor), quem, chave),
     )
     return cur_pg.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Motivos de não compra
+# ---------------------------------------------------------------------------
+
+
+def criar_motivo(cur_pg, dados):
+    descricao = (dados.get("descricao") or "").strip()
+    if not descricao or len(descricao) > 100:
+        raise Invalido("Descreva o motivo (até 100 caracteres).")
+    cur_pg.execute("SELECT 1 FROM motivo WHERE lower(descricao) = lower(%s)", (descricao,))
+    if cur_pg.fetchone():
+        raise Invalido("Esse motivo já existe.")
+    cur_pg.execute("SELECT COALESCE(max(ordem), 0) + 10 FROM motivo")
+    ordem = cur_pg.fetchone()[0]
+    cur_pg.execute("INSERT INTO motivo (descricao, ordem) VALUES (%s, %s) RETURNING id", (descricao, ordem))
+    return cur_pg.fetchone()[0]
+
+
+def alterar_motivo(cur_pg, id_, dados):
+    sets, vals = [], []
+    if "descricao" in dados:
+        d = (dados.get("descricao") or "").strip()
+        if not d or len(d) > 100:
+            raise Invalido("Descreva o motivo (até 100 caracteres).")
+        sets.append("descricao = %s")
+        vals.append(d)
+    if "ordem" in dados:
+        sets.append("ordem = %s")
+        vals.append(_int(dados, "ordem"))
+    if "ativo" in dados:
+        sets.append("ativo = %s")
+        vals.append(bool(dados["ativo"]))
+    if not sets:
+        raise Invalido("Nada para alterar.")
+    cur_pg.execute(f"UPDATE motivo SET {', '.join(sets)} WHERE id = %s", (*vals, id_))
+    return cur_pg.rowcount
