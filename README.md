@@ -1365,7 +1365,7 @@ Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobra
 O smoke do televendas grava ligações de teste num cliente da fila interna e confere a corrida (dois `/iniciar` em paralelo = UMA ligação), as validações, a dupla finalização e o descarte idempotente; imprime o SQL de limpeza no fim:
 
 ```powershell
-.\tests\smoke-televendas.ps1 -Usuario RAFAEL -Senha '****' -CodParc <cliente da fila interna>
+.\tests\smoke-televendas.ps1 -Usuario RAFAEL -CodParc <cliente da fila interna>   # -Usuario = NOME de login; a senha é perguntada
 ```
 
 O smoke da régua cobre apenas a régua de chamadas — que é a única parte da cobrança que **escreve** no banco por regra de negócio (trava de concorrência, cálculo da régua, transação).
