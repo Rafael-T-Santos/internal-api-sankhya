@@ -1319,6 +1319,26 @@ Só `GERENTE` (o perfil é lido da `AD_PERFILTVL` a cada requisição; operador 
 | `GET /config/tops`, `POST /config/tops`, `PUT /config/tops/{cod}` | Papéis de cada TOP (`conversao` ORCAMENTO/PEDIDO, `ultimaCompra`, `ativo`). Recusa deixar nenhuma TOP de última compra ativa (as listas parariam) |
 | `GET /config/parametros`, `PUT /config/parametros/{chave}` | `{valor}` inteiro, só para JANELA_ATRIBUICAO_DIAS (0–30), ATRASO_MAX_DIAS (0–365), TRAVA_MINUTOS (5–120), CODEMP |
 
+#### Ligações — `/api/televendas/chamadas/*` (Fase 3)
+
+Exigem perfil. Regra em `televendas_chamadas.py`. Tudo no Postgres; o Oracle só é lido.
+
+| Rota | Faz |
+|---|---|
+| `POST /chamadas/iniciar` | `{codParc, lista CARTEIRA\|INTERNA, codTelevend?}` → `201 {id, inicio, expiraEm, retomada}`. **Trava** o cliente por `TRAVA_MINUTOS`. `403` se o cliente não é da lista ou a escala não o liberou; `409 {emChamada}` se outro operador está ligando. Ligação já aberta pelo mesmo operador é devolvida (`retomada: true`) |
+| `PUT /chamadas/{id}/renovar` | Heartbeat: estica a trava. `409` se ela expirou e outro abriu o cliente (o registro ainda pode ser salvo) |
+| `PUT /chamadas/{id}/finalizar` | `{resultado*, desfecho?, motivoId?, retornoEm?, telefone?, contato?, obs?, notas?: [{nunota, tipo PEDIDO\|ORCAMENTO}]}`. Só `resultado` é obrigatório; desfecho só com `ATENDEU`; NUNOTA tem de existir e ser do cliente. Trava expirada não impede salvar. `409` se já registrada ou descartada |
+| `POST /chamadas/{id}/cancelar` | Descarta. **Idempotente**; aceita `?token=` (o `sendBeacon` ao fechar a aba não manda cabeçalho) |
+| `POST /chamadas/{id}/anexos` | multipart `arquivo` + `descricao`: sobe ao Drive (mesma conta da cobrança) e guarda o link |
+| `GET /clientes/{codParc}/historico` | Ligações registradas do cliente, com notas e anexos |
+| `GET /agenda?de=&ate=` | Retornos do operador que ainda são o último contato do cliente |
+| `GET /travas` | Quem está ligando para quem agora (o app consulta a cada 30 s) |
+| `GET /motivos` | Motivos de não compra ativos |
+
+A trava serializa por cliente com `pg_advisory_xact_lock(7001, codparc)` — o equivalente do `FOR UPDATE` da cobrança. O namespace 7001 existe porque o Postgres é compartilhado com o check-my-load.
+
+Motivos de não compra (só gerente): `GET/POST /config/motivos`, `PUT /config/motivos/{id}` (`{descricao?, ordem?, ativo?}`).
+
 **Conferência contra a consulta original** (só lê; rode depois de carregar a escala, num dia útil):
 
 ```bash
@@ -1330,16 +1350,23 @@ docker compose exec -T api-sankhya python scripts/conferir_listas.py interna < ~
 
 ## Testes
 
-Cinco. Os quatro em Python não precisam de banco; o da régua bate na API real.
+Seis em Python, sem banco, e dois smoke tests contra a API real; o da régua bate na API real.
 
 ```bash
 python tests/test_sessao.py
 python tests/test_listas.py     # regra da escala, hora de saída da OC, montagem do SQL das listas
 python tests/test_ficha.py      # série, ticket, frequência e "parou de comprar" da ficha
 python tests/test_config.py     # rotas da gerência: 403 para operador, validações, rollback, auditoria
+python tests/test_chamadas.py   # regras do registro: resultado obrigatório, NUNOTA do cliente, 409, idempotência
 ```
 
 Simula o Sankhya e o Oracle e confere o login compartilhado, o alias `/api/cobranca/login`, token adulterado, a sessão do televendas (operador, gerente sem vendedor, perfil inativo, sem perfil, tabela inexistente) e o fallback de `COBRANCA_SECRET`. **Rode antes de todo deploy que mexa em `auth.py`, `televendas.py` ou no login.**
+
+O smoke do televendas grava ligações de teste num cliente da fila interna e confere a corrida (dois `/iniciar` em paralelo = UMA ligação), as validações, a dupla finalização e o descarte idempotente; imprime o SQL de limpeza no fim:
+
+```powershell
+.\tests\smoke-televendas.ps1 -Usuario RAFAEL -Senha '****' -CodParc <cliente da fila interna>
+```
 
 O smoke da régua cobre apenas a régua de chamadas — que é a única parte da cobrança que **escreve** no banco por regra de negócio (trava de concorrência, cálculo da régua, transação).
 

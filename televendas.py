@@ -7,12 +7,16 @@ acesso ao televendas: o usuário precisa estar ATIVO na AD_PERFILTVL, que a
 gerência mantém. Tabelas e regras deste módulo são isoladas das da cobrança.
 """
 
+from datetime import date, timedelta
 from functools import wraps
 
 import cx_Oracle
 import psycopg2
 from flask import Blueprint, jsonify, request
+from werkzeug.utils import secure_filename
 
+import drive
+import televendas_chamadas as chamadas
 import televendas_config as tvconfig
 import televendas_ficha as ficha
 import televendas_listas as listas
@@ -435,3 +439,197 @@ def config_parametros_alterar(chave):
         return {}
 
     return _config(fazer)
+
+
+@bp.route("/api/televendas/config/motivos", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_motivos():
+    return _config(lambda pg, ora, quem: {"dados": chamadas.motivos(pg, so_ativos=False)})
+
+
+@bp.route("/api/televendas/config/motivos", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_motivos_criar():
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: {"id": tvconfig.criar_motivo(pg, corpo)}, 201)
+
+
+@bp.route("/api/televendas/config/motivos/<int:id_>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_motivos_alterar(id_):
+    """{descricao?, ordem?, ativo?}. Motivo já usado em ligação se desativa, não se apaga."""
+    corpo = _corpo()
+
+    def fazer(pg, ora, quem):
+        if not tvconfig.alterar_motivo(pg, id_, corpo):
+            raise tvconfig.Invalido(f"Motivo {id_} não existe.")
+        return {}
+
+    return _config(fazer)
+
+
+# ---------------------------------------------------------------------------
+# Ligações (Fase 3) — regra em televendas_chamadas.py
+# ---------------------------------------------------------------------------
+
+
+def _ligacao(fazer, codigo_ok=200, precisa_oracle=False):
+    """Uma transação no Postgres (+ Oracle só para leitura, se pedido).
+
+    Erros de regra (400/403/404/409) desfazem a transação e devolvem a mensagem
+    e, no 409, quem está com o cliente — a tela mostra isso em vez de um erro seco.
+    """
+    ora = pg = None
+    try:
+        pg = conectar_postgres()
+        if precisa_oracle:
+            ora = conectar_oracle()
+            if not ora:
+                return jsonify({"erro": "Falha na conexão com o banco"}), 500
+        with pg:
+            resultado = fazer(pg.cursor(), ora.cursor() if ora else None)
+        return jsonify({"sucesso": True, **resultado}), codigo_ok
+    except chamadas.ErroChamada as err:
+        return jsonify({"erro": str(err), **err.corpo}), err.status
+    except tvconfig.Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+    except PostgresNaoConfigurado as err:
+        return _erro(err, 503)
+    except psycopg2.Error as err:
+        return _erro(f"Erro no banco do televendas: {err}")
+    except cx_Oracle.Error as err:
+        return _erro(f"Erro de Banco de Dados: {err}")
+    finally:
+        if ora:
+            ora.close()
+        if pg:
+            pg.close()
+
+
+def _op():
+    return {"codUsu": request.operador["codUsu"], "nomeUsu": request.operador["nomeUsu"]}
+
+
+@bp.route("/api/televendas/chamadas/iniciar", methods=["POST"])
+@exige_televendas()
+def chamada_iniciar():
+    """{codParc, lista CARTEIRA|INTERNA, codTelevend? (só gerente, carteira de outro)}.
+
+    201 {id, inicio, expiraEm, retomada}. 403 se o cliente não está na lista ou a
+    escala ainda não o liberou; 409 {emChamada} se outro operador já está ligando.
+    """
+    corpo = _corpo()
+    ctx = request.televendas
+    try:
+        codparc = int(corpo.get("codParc"))
+    except (TypeError, ValueError):
+        return jsonify({"erro": "codParc é obrigatório."}), 400
+    lista = corpo.get("lista")
+    codtelevend = ctx["codVend"]
+    pedido = corpo.get("codTelevend")
+    if lista == "CARTEIRA" and pedido and int(pedido) != ctx["codVend"]:
+        if ctx["perfil"] != "GERENTE":
+            return jsonify({"erro": "Só a gerência liga para a carteira de outro televendas."}), 403
+        codtelevend = int(pedido)
+    if lista == "CARTEIRA" and not codtelevend:
+        return jsonify({"erro": "Seu usuário não tem carteira própria."}), 400
+
+    def fazer(pg, ora):
+        ext = chamadas.checar_elegivel(ora, pg, codparc, lista, codtelevend)
+        # Carteira: o vendedor é o DONO da carteira (gerente cobrindo falta). Fila
+        # interna: o do próprio operador, que é quem vai digitar o pedido.
+        codvend = codtelevend if lista == "CARTEIRA" else ctx["codVend"]
+        return chamadas.iniciar(pg, codparc, lista, _op(), codvend, ext)
+
+    return _ligacao(fazer, 201, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/chamadas/<int:id_>/renovar", methods=["PUT"])
+@exige_televendas()
+def chamada_renovar(id_):
+    return _ligacao(lambda pg, ora: chamadas.renovar(pg, id_, _op()))
+
+
+@bp.route("/api/televendas/chamadas/<int:id_>/finalizar", methods=["PUT"])
+@exige_televendas()
+def chamada_finalizar(id_):
+    """{resultado*, desfecho?, motivoId?, retornoEm?, telefone?, contato?, obs?, notas?: [{nunota, tipo}]}"""
+    corpo = _corpo()
+    return _ligacao(lambda pg, ora: chamadas.finalizar(pg, ora, id_, _op(), corpo), precisa_oracle=True)
+
+
+@bp.route("/api/televendas/chamadas/<int:id_>/cancelar", methods=["POST"])
+@exige_televendas()
+def chamada_cancelar(id_):
+    """Idempotente. Aceita ?token= porque o navigator.sendBeacon não manda cabeçalho."""
+    return _ligacao(lambda pg, ora: chamadas.cancelar(pg, id_, _op()))
+
+
+@bp.route("/api/televendas/chamadas/<int:id_>/anexos", methods=["POST"])
+@exige_televendas()
+def chamada_anexo(id_):
+    """multipart: `arquivo` (obrigatório), `descricao`. Sobe ao Drive ANTES de gravar
+    (na ordem inversa, um erro deixaria linha apontando para arquivo inexistente)."""
+    enviado = request.files.get("arquivo")
+    if not enviado or not enviado.filename:
+        return jsonify({"erro": "Envie o arquivo no campo 'arquivo'."}), 400
+    conteudo = enviado.read()
+    if not conteudo:
+        return jsonify({"erro": "Arquivo vazio."}), 400
+    if len(conteudo) > drive.LIMITE_BYTES:
+        return jsonify({"erro": f"Arquivo maior que {drive.LIMITE_BYTES // (1024 * 1024)} MB."}), 413
+    nome = secure_filename(enviado.filename) or "anexo"
+    descricao = (request.form.get("descricao") or "").strip()[:100] or nome[:100]
+    try:
+        subido = drive.enviar_arquivo(f"televendas-{id_}-{nome}", enviado.mimetype, conteudo)
+    except drive.DriveNaoConfigurado as err:
+        return jsonify({"erro": str(err)}), 503
+    except Exception as e:
+        return _erro(f"Falha ao enviar o arquivo para o Drive: {e}", 502)
+    return _ligacao(lambda pg, ora: chamadas.gravar_anexo(pg, id_, _op(), descricao, subido["url"]), 201)
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/historico", methods=["GET"])
+@exige_televendas()
+def cliente_historico(codparc):
+    """Ligações registradas do cliente (todas as listas e operadores), com notas e anexos."""
+    return _ligacao(lambda pg, ora: {"dados": chamadas.historico(pg, codparc)})
+
+
+@bp.route("/api/televendas/agenda", methods=["GET"])
+@exige_televendas()
+def agenda():
+    """?de=AAAA-MM-DD&ate=AAAA-MM-DD (padrão: 30 dias atrás até daqui a 7).
+    Retornos do operador que ainda são o último contato do cliente."""
+    try:
+        de = date.fromisoformat(request.args["de"]) if request.args.get("de") else date.today() - timedelta(days=30)
+        ate = date.fromisoformat(request.args["ate"]) if request.args.get("ate") else date.today() + timedelta(days=7)
+    except ValueError:
+        return jsonify({"erro": "Datas no formato AAAA-MM-DD."}), 400
+
+    def fazer(pg, ora):
+        itens = chamadas.agenda(pg, request.operador["codUsu"], de, ate)
+        nomes = tvconfig._nomes(
+            ora, "SELECT CODPARC, NOMEPARC, RAZAOSOCIAL FROM TGFPAR WHERE CODPARC IN ({ids})", [i["codParc"] for i in itens]
+        )
+        for i in itens:
+            fantasia, razao = nomes.get(i["codParc"], (None, None))
+            i["fantasia"] = (fantasia or "").strip() or None
+            i["razaoSocial"] = (razao or "").strip() or None
+        return {"de": de.isoformat(), "ate": ate.isoformat(), "dados": itens}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/travas", methods=["GET"])
+@exige_televendas()
+def travas():
+    """Quem está ligando para quem agora. Leve: o app consulta a cada 30 s."""
+    return _ligacao(lambda pg, ora: {"dados": chamadas.travas(pg)})
+
+
+@bp.route("/api/televendas/motivos", methods=["GET"])
+@exige_televendas()
+def motivos():
+    """Motivos de não compra ativos, para o formulário da ligação."""
+    return _ligacao(lambda pg, ora: {"dados": chamadas.motivos(pg)})
