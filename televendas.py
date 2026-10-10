@@ -20,6 +20,7 @@ import televendas_chamadas as chamadas
 import televendas_config as tvconfig
 import televendas_extras as extras
 import televendas_ficha as ficha
+import televendas_gerencia as gerencia
 import televendas_listas as listas
 from auth import exige_operador
 from db import conectar_oracle
@@ -742,3 +743,29 @@ def config_roteiros_criar():
 def config_roteiros_alterar(id_):
     corpo = _corpo()
     return _config(lambda pg, ora, quem: {"id": extras.salvar_roteiro(pg, corpo, id_)})
+
+
+# ---------------------------------------------------------------------------
+# Fase 4 (primeira parte): Ao vivo e indicadores — regra em televendas_gerencia.py
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/api/televendas/gerencia/ao-vivo", methods=["GET"])
+@exige_televendas(gerente=True)
+def gerencia_ao_vivo():
+    """Uma linha por operador: em ligação agora, números de hoje, último registro. A tela consulta a cada 30 s."""
+    return _ligacao(lambda pg, ora: gerencia.ao_vivo(pg, ora), precisa_oracle=True)
+
+
+@bp.route("/api/televendas/gerencia/indicadores", methods=["GET"])
+@exige_televendas(gerente=True)
+def gerencia_indicadores():
+    """?de=AAAA-MM-DD&ate=AAAA-MM-DD&codUsu=&lista=CARTEIRA|INTERNA (de e ate obrigatórios).
+
+    Produtividade por operador e por dia, resultados, desfechos e ranking dos
+    motivos de não compra. Só Postgres.
+    """
+    def fazer(pg, ora):
+        return gerencia.indicadores(pg, *gerencia.filtros(request.args))
+
+    return _ligacao(fazer)
