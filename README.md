@@ -1271,7 +1271,7 @@ Exige perfil. Clientes dos representantes externos cujo `TGFVEN.AD_CODVEND` é o
   "totalCarteira": 60, "aguardandoRota": 18, "totalRegistros": 42,
   "dados": [ { "codParc": 11842, "fantasia": "…", "cidade": "PENEDO", "bairro": "CENTRO",
                "codVendExterno": 2, "vendedor": "JOÃO", "ultimaCompra": "2026-09-19", "diasSemCompra": 18,
-               "diasAtraso": 0, "vlrAtrasado": 0, "ultimaOrdemCarga": 48213, "dataOrdemCarga": "2026-09-19",
+               "diasAtraso": 0, "vlrAtrasado": 0, "ultimaOrdemCarga": 48213, "dataOrdemCarga": "2026-09-22",
                "horaSaidaOrdem": "07:40",
                "contatos": [ { "codContato": 1, "nome": "MARCOS", "telefone": null, "celular": "82998124410", "email": null } ],
                "rota": { "diaVisita": 2, "diaVisitaDesc": "TER", "liberado": true, "liberaEm": "quarta" },

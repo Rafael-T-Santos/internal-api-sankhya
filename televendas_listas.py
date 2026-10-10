@@ -167,11 +167,12 @@ FIN_PEND AS
 -- Última ordem de carga: a nota mais recente do cliente, entre as TOPs de
 -- compra, que JÁ TEM ordem de carga. Um pedido de hoje ainda sem carregamento
 -- não esconde a última entrega real (plano §12, pedido novo de 03/10).
+-- A data da OC é a da carga (TGFORD.DTPREVSAIDA, previsão de saída), como no
+-- relatório do admin (docs/rel_com_ordem_carga.txt no televendas), não a do pedido.
 ULT_OC AS
 (
     SELECT CAB.CODPARC,
-           MAX(CAB.ORDEMCARGA) KEEP (DENSE_RANK LAST ORDER BY CAB.DTNEG, CAB.NUNOTA) AS ORDEMCARGA,
-           MAX(CAB.DTNEG)      KEEP (DENSE_RANK LAST ORDER BY CAB.DTNEG, CAB.NUNOTA) AS DTNEG_OC
+           MAX(CAB.ORDEMCARGA) KEEP (DENSE_RANK LAST ORDER BY CAB.DTNEG, CAB.NUNOTA) AS ORDEMCARGA
       FROM TGFCAB CAB
      INNER JOIN BASE B ON B.CODPARC = CAB.CODPARC
      WHERE CAB.CODEMP = :CODEMP
@@ -187,7 +188,7 @@ SELECT
     NVL(FP.DIAS_MAIOR_ATRASO, 0) AS DIAS_ATRASO,
     NVL(FP.VLR_ATRASADO, 0) AS VLR_ATRASADO,
     UO.ORDEMCARGA,
-    UO.DTNEG_OC,
+    ORD.DTPREVSAIDA,
     ORD.HORASAIDA
 FROM BASE B
 LEFT JOIN C_VENDAS_PAR VP ON VP.CODPARC = B.CODPARC
