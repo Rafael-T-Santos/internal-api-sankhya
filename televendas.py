@@ -22,6 +22,7 @@ import televendas_extras as extras
 import televendas_ficha as ficha
 import televendas_gerencia as gerencia
 import televendas_listas as listas
+import televendas_sugestoes as sugestoes
 from auth import exige_operador
 from db import conectar_oracle
 from pg import PostgresNaoConfigurado, conectar_postgres
@@ -300,6 +301,13 @@ def cliente_mix(codparc):
 def cliente_ultimo_pedido(codparc):
     """Itens da nota mais recente do cliente entre as TOPs de compra (consulta do admin)."""
     return _ficha(codparc, ficha.ultimo_pedido)
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/sugestoes", methods=["GET"])
+@exige_televendas()
+def cliente_sugestoes(codparc):
+    """Até 15 produtos para oferecer (recomendação comercial do admin)."""
+    return _ficha(codparc, sugestoes.sugestoes)
 
 
 # ---------------------------------------------------------------------------
