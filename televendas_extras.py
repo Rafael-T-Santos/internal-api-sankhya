@@ -93,17 +93,21 @@ def salvar_meta(cur_pg, dados):
 def meu_dia(cur_pg, codusu):
     """Hoje e o mês corrente do operador (datas no fuso de Maceió: a sessão do pg.py)."""
     cur_pg.execute(
+        # Ligações e atendidas = só as FEITAS (é o que a meta de ligações/dia mede);
+        # recebidas à parte; vendas e orçamentos somam as duas.
         """SELECT
-             count(*) FILTER (WHERE inicio::date = current_date),
-             count(*) FILTER (WHERE inicio::date = current_date AND resultado = 'ATENDEU'),
+             count(*) FILTER (WHERE inicio::date = current_date AND lista <> 'RECEBIDA'),
+             count(*) FILTER (WHERE inicio::date = current_date AND lista <> 'RECEBIDA' AND resultado = 'ATENDEU'),
              count(*) FILTER (WHERE inicio::date = current_date AND desfecho = 'VENDA'),
              count(*) FILTER (WHERE inicio::date = current_date AND desfecho = 'ORCAMENTO'),
-             count(*),
-             count(*) FILTER (WHERE resultado = 'ATENDEU'),
+             count(*) FILTER (WHERE lista <> 'RECEBIDA'),
+             count(*) FILTER (WHERE lista <> 'RECEBIDA' AND resultado = 'ATENDEU'),
              count(*) FILTER (WHERE desfecho = 'VENDA'),
              count(*) FILTER (WHERE desfecho = 'ORCAMENTO'),
              count(DISTINCT codparc) FILTER (WHERE desfecho = 'VENDA'),
-             count(DISTINCT inicio::date)
+             count(DISTINCT inicio::date),
+             count(*) FILTER (WHERE inicio::date = current_date AND lista = 'RECEBIDA'),
+             count(*) FILTER (WHERE lista = 'RECEBIDA')
            FROM chamada
           WHERE codusu = %s AND situacao = 'FINALIZADA'
             AND inicio >= date_trunc('month', now())""",
@@ -118,20 +122,22 @@ def meu_dia(cur_pg, codusu):
     )
     m = cur_pg.fetchone() or (None, None, None)
     cur_pg.execute(
-        """SELECT c.id, c.codparc, c.inicio, c.resultado, c.desfecho, c.lista
+        """SELECT c.id, c.codparc, c.inicio, c.resultado, c.desfecho, c.lista, c.contato_id, k.nome
              FROM chamada c
+             LEFT JOIN contato k ON k.id = c.contato_id
             WHERE c.codusu = %s AND c.situacao = 'FINALIZADA' AND c.inicio::date = current_date
             ORDER BY c.inicio DESC""",
         (codusu,),
     )
     ligacoes = [
-        {"id": x[0], "codParc": x[1], "inicio": x[2].isoformat(), "resultado": x[3], "desfecho": x[4], "lista": x[5]}
+        {"id": x[0], "codParc": x[1], "inicio": x[2].isoformat(), "resultado": x[3], "desfecho": x[4], "lista": x[5],
+         "contatoId": x[6], "nomeContato": x[7]}
         for x in cur_pg.fetchall()
     ]
     return {
         "hoje": hoje.isoformat(),
         "competencia": comp,
-        "dia": {"ligacoes": r[0], "atendidas": r[1], "vendas": r[2], "orcamentos": r[3]},
+        "dia": {"ligacoes": r[0], "atendidas": r[1], "vendas": r[2], "orcamentos": r[3], "recebidas": r[10]},
         "mes": {
             "ligacoes": r[4],
             "atendidas": r[5],
@@ -139,6 +145,7 @@ def meu_dia(cur_pg, codusu):
             "orcamentos": r[7],
             "clientesComVenda": r[8],
             "diasTrabalhados": r[9],
+            "recebidas": r[11],
             "valorVendido": None,  # Fase 4 (televendas.conversao)
         },
         "meta": {
