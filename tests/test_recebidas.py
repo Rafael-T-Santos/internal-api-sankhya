@@ -136,6 +136,41 @@ chk("conferir: sem cadastro ainda = não liga", not r["ligado"])
 r = R.conferir_contato(Pg(contato=contato(documento=None)), Ora({}), 8)
 chk("conferir: contato sem documento = só à mão", not r["ligado"] and "mão" in r["motivo"])
 
+# ---- Ligação automática de todos os pendentes (foto_listas e "Conferir todos") ----
+class PgPend(Pg):
+    def __init__(self, pendentes):
+        super().__init__()
+        self.pendentes = pendentes
+
+    def execute(self, sql, vals=None):
+        self.sqls.append((sql, vals))
+        if "SELECT id, documento FROM contato" in sql:
+            self.r = self.pendentes
+        elif "SELECT count(*) FROM contato" in sql:
+            self.r = [(1,)]
+        else:
+            self.r = []
+
+
+class OraDocs:
+    def __init__(self, cadastro):
+        self.cadastro, self.r, self.chamadas = cadastro, [], 0
+
+    def execute(self, sql, binds=None):
+        self.chamadas += 1
+        self.r = [(d, c) for d in binds.values() for c in self.cadastro.get(d, [])]
+
+    def fetchall(self):
+        return self.r
+
+
+pg = PgPend([(1, "11222333000181"), (2, "52998224725"), (3, "11444777000161")])
+ora_d = OraDocs({"11222333000181": [900], "52998224725": [901, 902]})
+r = R.ligar_pendentes(pg, ora_d)
+chk("ligar pendentes: liga quem tem um cadastro, deixa o repetido", r == {"ligados": 1, "repetidos": 1, "pendentes": 1})
+chk("ligar pendentes: uma consulta ao Oracle por lote, não por contato", ora_d.chamadas == 1)
+chk("ligar pendentes: passa as ligações do contato 1 para o cliente 900", any("UPDATE chamada SET codparc" in s and v == (900, 1) for s, v in pg.sqls))
+
 # ---- Lista da aba Recebida ----
 pg = Pg()
 R.listar_recebidas(pg, 25, 48, 7, "TODAS")

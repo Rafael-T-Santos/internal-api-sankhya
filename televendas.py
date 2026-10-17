@@ -816,6 +816,14 @@ def contatos_conferir(id_):
     return _ligacao(lambda pg, ora: recebidas.conferir_contato(pg, ora, id_), precisa_oracle=True)
 
 
+@bp.route("/api/televendas/contatos/conferir-todos", methods=["POST"])
+@exige_televendas()
+def contatos_conferir_todos():
+    """Liga ao cadastro todos os contatos pendentes cujo CNPJ/CPF já está no Sankhya.
+    {ligados, repetidos, pendentes}. O mesmo roda todo dia no scripts/foto_listas.py."""
+    return _ligacao(lambda pg, ora: recebidas.ligar_pendentes(pg, ora), precisa_oracle=True)
+
+
 @bp.route("/api/televendas/contatos/<int:id_>/ligar", methods=["PUT"])
 @exige_televendas(gerente=True)
 def contatos_ligar(id_):
