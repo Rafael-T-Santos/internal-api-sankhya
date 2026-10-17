@@ -52,6 +52,11 @@ sql, binds = R.sql_busca(R.entender("82999540512"))
 chk("busca de 11 dígitos junta documento e telefone com OR", ":DOC" in sql and ":FONE" in sql and " OR " in sql)
 chk("telefone também procura nos contatos (TGFCTT)", "TGFCTT" in sql and binds["FONE"] == "99540512")
 chk("busca limita a 30", "ROWNUM <= 30" in sql)
+import re as _re  # noqa: E402
+_sel = sql.split("SELECT", 2)[2].split("FROM TGFPAR")[0]
+_nomes = _re.findall(r"AS (\w+)", _sel)
+chk("colunas da busca têm nomes únicos (senão ORA-00918 no SELECT *)", len(_nomes) == 14 and len(set(_nomes)) == 14)
+chk("vendedor 0 não entra como representante", "NULLIF(P.CODVEND, 0)" in sql)
 
 # ---- Documento ----
 chk("CNPJ válido", R.cnpj_valido("11222333000181"))
@@ -64,6 +69,7 @@ d = R.dono("J", "S", "S", "AL", 30, "JOAO REP", 41, "MARIA")
 chk("representante ligado a televendas = carteira dele", d["tipo"] == "CARTEIRA" and d["codVend"] == 41 and d["apelido"] == "MARIA")
 chk("PJ de AL sem vendedor = fila interna", R.dono("J", "S", "S", "AL", 0, None, 0, None)["tipo"] == "INTERNA")
 chk("pessoa física sem vendedor = nenhuma lista", R.dono("F", "S", "S", "AL", 0, None, 0, None)["tipo"] == "NENHUMA")
+chk("vendedor 0 (\"<SEM VENDEDOR>\") não vira representante", R.dono("F", "S", "S", "AL", 0, "<SEM VENDEDOR>", 0, None)["representante"] is None)
 d = R.dono("J", "S", "S", "PE", 30, "JOAO REP", 0, None)
 chk("representante sem televendas = nenhuma lista, com o representante", d["tipo"] == "NENHUMA" and d["representante"] == "JOAO REP")
 

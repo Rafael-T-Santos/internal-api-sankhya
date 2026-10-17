@@ -112,14 +112,18 @@ def entender(q):
 # Oracle: parceiros
 # ---------------------------------------------------------------------------
 
-_COLUNAS = """P.CODPARC, P.NOMEPARC, P.RAZAOSOCIAL, P.CGC_CPF, CID.NOMECID, UFS.UF,
-       P.ATIVO, P.CLIENTE, P.TELEFONE, P.TIPPESSOA, NVL(P.CODVEND, 0),
-       VEXT.APELIDO, NVL(VEXT.AD_CODVEND, 0), TV.APELIDO"""
+# Aliases em todas: a busca embrulha isto num SELECT * (ROWNUM), e duas colunas
+# com o mesmo nome (APELIDO do representante e do televendas) dão ORA-00918.
+_COLUNAS = """P.CODPARC AS CODPARC, P.NOMEPARC AS NOMEPARC, P.RAZAOSOCIAL AS RAZAOSOCIAL,
+       P.CGC_CPF AS CGC_CPF, CID.NOMECID AS NOMECID, UFS.UF AS UF,
+       P.ATIVO AS ATIVO, P.CLIENTE AS CLIENTE, P.TELEFONE AS TELEFONE, P.TIPPESSOA AS TIPPESSOA,
+       NVL(P.CODVEND, 0) AS CODVEND, VEXT.APELIDO AS APELIDO_REP,
+       NVL(VEXT.AD_CODVEND, 0) AS CODTELEVEND, TV.APELIDO AS APELIDO_TV"""
 
 _DE = """FROM TGFPAR P
   LEFT JOIN TSICID CID ON CID.CODCID = P.CODCID
   LEFT JOIN TSIUFS UFS ON UFS.CODUF = CID.UF
-  LEFT JOIN TGFVEN VEXT ON VEXT.CODVEND = P.CODVEND
+  LEFT JOIN TGFVEN VEXT ON VEXT.CODVEND = NULLIF(P.CODVEND, 0)  -- o vendedor 0 é "<SEM VENDEDOR>"
   LEFT JOIN TGFVEN TV ON TV.CODVEND = VEXT.AD_CODVEND"""
 
 _FONE = """(SUBSTR(REGEXP_REPLACE(P.TELEFONE, '[^0-9]', ''), -8) = :FONE
@@ -161,6 +165,8 @@ def dono(tippessoa, cliente, ativo, uf, codvend, apelido_rep, codtelevend, apeli
     (TGFVEN.AD_CODVEND), a mesma ligação das listas. Fila interna = a regra da
     fila (PJ, cliente, ativo, de AL, sem vendedor).
     """
+    if not codvend:
+        apelido_rep = None  # TGFVEN 0 = "<SEM VENDEDOR>": não é representante
     if codtelevend:
         return {"tipo": "CARTEIRA", "codVend": int(codtelevend), "apelido": _txt(apelido_tv),
                 "representante": _txt(apelido_rep), "codVendExterno": int(codvend) or None}
