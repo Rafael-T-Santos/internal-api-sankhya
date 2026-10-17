@@ -506,6 +506,65 @@ def alterar_assunto(cur_pg, id_, dados):
 
 
 # ---------------------------------------------------------------------------
+# Lista de recebidas (aba Recebida)
+# ---------------------------------------------------------------------------
+
+FILTROS = ("TODAS", "MINHAS", "CARTEIRA", "EQUIPE")
+MAX_DIAS_LISTA = 31
+
+
+def listar_recebidas(cur_pg, codusu, codvend, dias=7, filtro="TODAS"):
+    """Recebidas finalizadas dos últimos `dias` (hoje incluído).
+
+    TODAS = as que o operador atendeu + as de clientes da carteira dele (atendidas
+    por qualquer um). MINHAS / CARTEIRA = uma das duas. EQUIPE = todas (gerente).
+    `codvend` da chamada é o televendas dono da carteira na hora da ligação.
+    """
+    if filtro not in FILTROS:
+        raise Invalido(f"filtro é um de {', '.join(FILTROS)}.")
+    if not 1 <= dias <= MAX_DIAS_LISTA:
+        raise Invalido(f"dias vai de 1 a {MAX_DIAS_LISTA}.")
+    quem, vals = {
+        "MINHAS": ("c.codusu = %s", [codusu]),
+        "CARTEIRA": ("c.codvend = %s", [codvend]),
+        "TODAS": ("(c.codusu = %s OR c.codvend = %s)", [codusu, codvend]),
+        "EQUIPE": ("true", []),
+    }[filtro]
+    cur_pg.execute(
+        f"""SELECT c.id, c.codparc, c.contato_id, k.nome, c.inicio, c.codusu, c.nome_usu, c.codvend,
+                   s.descricao, c.desfecho, c.obs, c.retorno_em
+              FROM chamada c
+              LEFT JOIN assunto s ON s.id = c.assunto_id
+              LEFT JOIN contato k ON k.id = c.contato_id
+             WHERE c.lista = 'RECEBIDA' AND c.situacao = 'FINALIZADA'
+               AND c.inicio::date > current_date - %s
+               AND {quem}
+             ORDER BY c.inicio DESC
+             LIMIT 500""",
+        [dias, *vals],
+    )
+    return [
+        {
+            "id": r[0],
+            "codParc": r[1],
+            "contatoId": r[2],
+            "nomeContato": r[3],
+            "inicio": _iso(r[4]),
+            "codUsu": r[5],
+            "nomeUsu": r[6],
+            "codVend": r[7],
+            "minha": r[5] == codusu,
+            "daMinhaCarteira": codvend is not None and r[7] == codvend,
+            "assunto": r[8],
+            "desfecho": r[9],
+            "obs": r[10],
+            "retornoEm": _iso(r[11]),
+        }
+        for r in cur_pg.fetchall()
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Receita (cnpj.ws): preencher o formulário do contato
 # ---------------------------------------------------------------------------
 

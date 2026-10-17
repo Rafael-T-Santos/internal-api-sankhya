@@ -136,6 +136,16 @@ chk("conferir: sem cadastro ainda = não liga", not r["ligado"])
 r = R.conferir_contato(Pg(contato=contato(documento=None)), Ora({}), 8)
 chk("conferir: contato sem documento = só à mão", not r["ligado"] and "mão" in r["motivo"])
 
+# ---- Lista da aba Recebida ----
+pg = Pg()
+R.listar_recebidas(pg, 25, 48, 7, "TODAS")
+sql, vals = pg.sqls[-1]
+chk("lista TODAS = atendidas por mim OU da minha carteira", "(c.codusu = %s OR c.codvend = %s)" in sql and vals == [7, 25, 48])
+R.listar_recebidas(pg, 25, 48, 1, "CARTEIRA")
+chk("lista CARTEIRA = só do dono da carteira", "c.codvend = %s" in pg.sqls[-1][0] and pg.sqls[-1][1] == [1, 48])
+chk("filtro inválido = 400", erro(lambda: R.listar_recebidas(Pg(), 25, 48, 7, "OUTRO"), R.Invalido))
+chk("mais de 31 dias = 400", erro(lambda: R.listar_recebidas(Pg(), 25, 48, 60, "TODAS"), R.Invalido))
+
 # ---- Receita ----
 d = R.dados_receita(
     {
@@ -177,6 +187,7 @@ chk("recebida sem cliente nem contato = 400", r.status_code == 400)
 r = c.post("/api/televendas/chamadas/iniciar", headers=H, json={"lista": "RECEBIDA", "codParc": 1, "contatoId": 2})
 chk("recebida com cliente E contato = 400", r.status_code == 400)
 chk("receita com CNPJ inválido = 400", c.get("/api/televendas/receita/123", headers=H).status_code == 400)
+chk("operador não vê recebidas da equipe (403)", c.get("/api/televendas/recebidas?filtro=EQUIPE", headers=H).status_code == 403)
 chk("operador não liga contato à mão (403)", c.put("/api/televendas/contatos/8/ligar", headers=H, json={"codParc": 1}).status_code == 403)
 
 print("TUDO OK" if ok else "HOUVE FALHA")

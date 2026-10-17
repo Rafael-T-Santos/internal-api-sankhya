@@ -735,6 +735,36 @@ def receita(documento):
     return jsonify({"sucesso": True, "documento": doc, **recebidas.dados_receita(bruto)})
 
 
+@bp.route("/api/televendas/recebidas", methods=["GET"])
+@exige_televendas()
+def recebidas_listar():
+    """?dias=7&filtro=TODAS|MINHAS|CARTEIRA|EQUIPE (EQUIPE só gerente).
+
+    As recebidas que o operador atendeu e as de clientes da carteira dele, com o
+    nome do cliente (Oracle) ou do contato sem cadastro.
+    """
+    ctx = request.televendas
+    filtro = request.args.get("filtro") or "TODAS"
+    try:
+        dias = int(request.args.get("dias") or 7)
+    except ValueError:
+        return jsonify({"erro": "dias precisa ser número."}), 400
+    if filtro == "EQUIPE" and ctx["perfil"] != "GERENTE":
+        return jsonify({"erro": "Só a gerência vê as recebidas de toda a equipe."}), 403
+
+    def fazer(pg, ora):
+        itens = recebidas.listar_recebidas(pg, request.operador["codUsu"], ctx["codVend"], dias, filtro)
+        nomes = tvconfig._nomes(
+            ora, "SELECT CODPARC, NOMEPARC, RAZAOSOCIAL FROM TGFPAR WHERE CODPARC IN ({ids})", [i["codParc"] for i in itens]
+        )
+        for i in itens:
+            fantasia, razao = nomes.get(i["codParc"], (None, None)) if i["codParc"] else (None, None)
+            i["fantasia"] = (fantasia or "").strip() or (razao or "").strip() or None
+        return {"dias": dias, "filtro": filtro, "dados": itens}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
 @bp.route("/api/televendas/contatos", methods=["GET"])
 @exige_televendas()
 def contatos_listar():
