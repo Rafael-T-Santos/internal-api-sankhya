@@ -22,7 +22,9 @@ import televendas_extras as extras
 import televendas_ficha as ficha
 import televendas_gerencia as gerencia
 import televendas_listas as listas
+import televendas_recebidas as recebidas
 import televendas_sugestoes as sugestoes
+import cnpj
 from auth import exige_operador
 from db import conectar_oracle
 from pg import PostgresNaoConfigurado, conectar_postgres
@@ -472,6 +474,27 @@ def config_motivos_criar():
     return _config(lambda pg, ora, quem: {"id": tvconfig.criar_motivo(pg, corpo)}, 201)
 
 
+@bp.route("/api/televendas/config/assuntos", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_assuntos():
+    return _config(lambda pg, ora, quem: {"dados": recebidas.assuntos(pg, so_ativos=False)})
+
+
+@bp.route("/api/televendas/config/assuntos", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_assuntos_criar():
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: recebidas.criar_assunto(pg, corpo), 201)
+
+
+@bp.route("/api/televendas/config/assuntos/<int:id_>", methods=["PUT"])
+@exige_televendas(gerente=True)
+def config_assuntos_alterar(id_):
+    """{descricao?, ordem?, ativo?}. Assunto usado se desativa, não se apaga."""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: recebidas.alterar_assunto(pg, id_, corpo))
+
+
 @bp.route("/api/televendas/config/motivos/<int:id_>", methods=["PUT"])
 @exige_televendas(gerente=True)
 def config_motivos_alterar(id_):
@@ -509,8 +532,12 @@ def _ligacao(fazer, codigo_ok=200, precisa_oracle=False):
         return jsonify({"sucesso": True, **resultado}), codigo_ok
     except chamadas.ErroChamada as err:
         return jsonify({"erro": str(err), **err.corpo}), err.status
+    except recebidas.JaCadastrado as err:
+        return jsonify({"erro": str(err), "codParc": err.codparc}), 409
     except tvconfig.Invalido as err:
         return jsonify({"erro": str(err)}), 400
+    except listas.ConfiguracaoIncompleta as err:
+        return _erro(err, 503)
     except PostgresNaoConfigurado as err:
         return _erro(err, 503)
     except psycopg2.Error as err:
@@ -535,9 +562,14 @@ def chamada_iniciar():
 
     201 {id, inicio, expiraEm, retomada}. 403 se o cliente não está na lista ou a
     escala ainda não o liberou; 409 {emChamada} se outro operador já está ligando.
+
+    Recebida: {lista: "RECEBIDA", codParc | contatoId}. Sem regra de lista e sem
+    409 por trava de outro (vem como aviso em emChamada).
     """
     corpo = _corpo()
     ctx = request.televendas
+    if corpo.get("lista") == "RECEBIDA":
+        return _iniciar_recebida(corpo)
     try:
         codparc = int(corpo.get("codParc"))
     except (TypeError, ValueError):
@@ -560,6 +592,35 @@ def chamada_iniciar():
         return chamadas.iniciar(pg, codparc, lista, _op(), codvend, ext)
 
     return _ligacao(fazer, 201, precisa_oracle=True)
+
+
+def _iniciar_recebida(corpo):
+    try:
+        codparc = int(corpo["codParc"]) if corpo.get("codParc") else None
+        contato_id = int(corpo["contatoId"]) if corpo.get("contatoId") else None
+    except (TypeError, ValueError):
+        return jsonify({"erro": "codParc e contatoId são números."}), 400
+    if (codparc is None) == (contato_id is None):
+        return jsonify({"erro": "Informe o cliente (codParc) ou o contato sem cadastro (contatoId)."}), 400
+
+    def fazer(pg, ora):
+        codvend = codvend_ext = None
+        if codparc is not None:
+            p = recebidas.parceiro(ora, codparc)
+            if not p:
+                raise recebidas.Invalido(f"Cliente {codparc} não existe no Sankhya.")
+            # Para os relatórios: de quem era o cliente quando ligou.
+            codvend = p["dono"].get("codVend")
+            codvend_ext = p["dono"].get("codVendExterno")
+        else:
+            k = recebidas.ler_contato(pg, contato_id)
+            if not k:
+                raise recebidas.Invalido(f"Contato {contato_id} não existe.")
+            if k["codParc"]:
+                raise recebidas.Invalido(f"Este contato já virou o cliente #{k['codParc']}: abra o cliente.")
+        return chamadas.iniciar_recebida(pg, codparc, contato_id, _op(), codvend, codvend_ext)
+
+    return _ligacao(fazer, 201, precisa_oracle=codparc is not None)
 
 
 @bp.route("/api/televendas/chamadas/<int:id_>/renovar", methods=["PUT"])
@@ -612,6 +673,174 @@ def chamada_anexo(id_):
 def cliente_historico(codparc):
     """Ligações registradas do cliente (todas as listas e operadores), com notas e anexos."""
     return _ligacao(lambda pg, ora: {"dados": chamadas.historico(pg, codparc)})
+
+
+# ---------------------------------------------------------------------------
+# Ligações recebidas — regra em televendas_recebidas.py
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/api/televendas/busca", methods=["GET"])
+@exige_televendas()
+def busca():
+    """?q= CNPJ/CPF, código, telefone (últimos 8 dígitos) ou parte do nome.
+
+    {criterios, dados: [parceiros com dono], contatos: [sem cadastro]}. Documento
+    digitado que já existe na TGFPAR liga sozinho o contato que tiver o mesmo.
+    """
+    try:
+        crit = recebidas.entender(request.args.get("q"))
+    except recebidas.Invalido as err:
+        return jsonify({"erro": str(err)}), 400
+
+    def fazer(pg, ora):
+        dados = recebidas.buscar_parceiros(ora, crit)
+        contatos = recebidas.buscar_contatos(pg, crit)
+        if crit["doc"] and dados and contatos:
+            for k in contatos:
+                recebidas.conferir_contato(pg, ora, k["id"])
+            contatos = recebidas.buscar_contatos(pg, crit)
+        return {"criterios": {k: v for k, v in crit.items() if v is not None}, "dados": dados, "contatos": contatos}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/clientes/<int:codparc>/resumo", methods=["GET"])
+@exige_televendas()
+def cliente_resumo(codparc):
+    """O cliente no formato das linhas das listas (para a ficha), de qualquer lista
+    ou de nenhuma, com `dono`. 404 se não existe."""
+    def fazer(pg, ora):
+        hoje, c = recebidas.cliente_avulso(ora, pg, codparc)
+        if not c:
+            raise chamadas.NaoEncontrado(f"Cliente {codparc} não existe no Sankhya.")
+        return {"hoje": hoje.isoformat(), "dados": c}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/receita/<path:documento>", methods=["GET"])
+@exige_televendas()
+def receita(documento):
+    """Dados da Receita (cnpj.ws) para preencher o contato sem cadastro. Não grava nada."""
+    doc = cnpj.limpar_cnpj(documento)
+    if not doc:
+        return jsonify({"erro": "CNPJ inválido (confira os dígitos)."}), 400
+    try:
+        bruto, erro = cnpj.consultar_cnpjws(doc)
+    except RuntimeError as err:
+        return _erro(err, 503)
+    if erro:
+        return jsonify({"erro": erro}), 404 if erro == cnpj.ERRO_NAO_ENCONTRADO else 502
+    return jsonify({"sucesso": True, "documento": doc, **recebidas.dados_receita(bruto)})
+
+
+@bp.route("/api/televendas/recebidas", methods=["GET"])
+@exige_televendas()
+def recebidas_listar():
+    """?dias=7&filtro=TODAS|MINHAS|CARTEIRA|EQUIPE (EQUIPE só gerente).
+
+    As recebidas que o operador atendeu e as de clientes da carteira dele, com o
+    nome do cliente (Oracle) ou do contato sem cadastro.
+    """
+    ctx = request.televendas
+    filtro = request.args.get("filtro") or "TODAS"
+    try:
+        dias = int(request.args.get("dias") or 7)
+    except ValueError:
+        return jsonify({"erro": "dias precisa ser número."}), 400
+    if filtro == "EQUIPE" and ctx["perfil"] != "GERENTE":
+        return jsonify({"erro": "Só a gerência vê as recebidas de toda a equipe."}), 403
+
+    def fazer(pg, ora):
+        itens = recebidas.listar_recebidas(pg, request.operador["codUsu"], ctx["codVend"], dias, filtro)
+        nomes = tvconfig._nomes(
+            ora, "SELECT CODPARC, NOMEPARC, RAZAOSOCIAL FROM TGFPAR WHERE CODPARC IN ({ids})", [i["codParc"] for i in itens]
+        )
+        for i in itens:
+            fantasia, razao = nomes.get(i["codParc"], (None, None)) if i["codParc"] else (None, None)
+            i["fantasia"] = (fantasia or "").strip() or (razao or "").strip() or None
+        return {"dias": dias, "filtro": filtro, "dados": itens}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/contatos", methods=["GET"])
+@exige_televendas()
+def contatos_listar():
+    """?pendentes=1 (padrão) só os que ainda não têm cadastro; ?pendentes=0 todos."""
+    pendentes = request.args.get("pendentes", "1") != "0"
+    return _ligacao(lambda pg, ora: {"dados": recebidas.listar_contatos(pg, pendentes)})
+
+
+@bp.route("/api/televendas/contatos", methods=["POST"])
+@exige_televendas()
+def contatos_criar():
+    """{documento?, nome*, fantasia?, telefone?, cidade?, uf?, obs?} -> 201 {id, existente}.
+    409 {codParc} se o documento já tem cadastro no Sankhya."""
+    corpo = _corpo()
+    return _ligacao(
+        lambda pg, ora: recebidas.criar_contato(pg, ora, corpo, request.operador["codUsu"]), 201, precisa_oracle=True
+    )
+
+
+@bp.route("/api/televendas/contatos/<int:id_>", methods=["GET"])
+@exige_televendas()
+def contatos_ler(id_):
+    def fazer(pg, ora):
+        k = recebidas.ler_contato(pg, id_)
+        if not k:
+            raise chamadas.NaoEncontrado(f"Contato {id_} não existe.")
+        return {"dados": k}
+
+    return _ligacao(fazer)
+
+
+@bp.route("/api/televendas/contatos/<int:id_>", methods=["PUT"])
+@exige_televendas()
+def contatos_alterar(id_):
+    corpo = _corpo()
+    return _ligacao(lambda pg, ora: recebidas.alterar_contato(pg, ora, id_, corpo), precisa_oracle=True)
+
+
+@bp.route("/api/televendas/contatos/<int:id_>/historico", methods=["GET"])
+@exige_televendas()
+def contatos_historico(id_):
+    return _ligacao(lambda pg, ora: {"dados": chamadas.historico_contato(pg, id_)})
+
+
+@bp.route("/api/televendas/contatos/<int:id_>/conferir", methods=["POST"])
+@exige_televendas()
+def contatos_conferir(id_):
+    """Procura o documento na TGFPAR e liga se achar um cadastro só."""
+    return _ligacao(lambda pg, ora: recebidas.conferir_contato(pg, ora, id_), precisa_oracle=True)
+
+
+@bp.route("/api/televendas/contatos/<int:id_>/ligar", methods=["PUT"])
+@exige_televendas(gerente=True)
+def contatos_ligar(id_):
+    """{codParc}: liga à mão (contato sem documento, ou documento repetido no Sankhya)."""
+    try:
+        codparc = int(_corpo().get("codParc"))
+    except (TypeError, ValueError):
+        return jsonify({"erro": "codParc é obrigatório."}), 400
+    quem = f"{request.operador['nomeUsu']} ({request.operador['codUsu']})"
+
+    def fazer(pg, ora):
+        if not recebidas.parceiro(ora, codparc):
+            raise recebidas.Invalido(f"Cliente {codparc} não existe no Sankhya.")
+        if not recebidas.ligar_contato(pg, id_, codparc, quem):
+            raise recebidas.Invalido("Contato não existe ou já está ligado a um cliente.")
+        return {"codParc": codparc}
+
+    return _ligacao(fazer, precisa_oracle=True)
+
+
+@bp.route("/api/televendas/assuntos", methods=["GET"])
+@exige_televendas()
+def assuntos():
+    """Assuntos ativos, para o registro da ligação recebida."""
+    return _ligacao(lambda pg, ora: {"dados": recebidas.assuntos(pg)})
 
 
 @bp.route("/api/televendas/agenda", methods=["GET"])

@@ -16,13 +16,23 @@ OP = {"codUsu": 25, "nomeUsu": "RAFAEL"}
 class Pg:
     """Simula a chamada `situacao`, do operador `dono`, e uma trava aberta opcional."""
 
-    def __init__(self, situacao="ABERTA", dono=25, aberta=None):
+    def __init__(self, situacao="ABERTA", dono=25, aberta=None, lista="CARTEIRA", codparc=11842, abertas=None):
         self.situacao, self.dono, self.aberta, self.r, self.sqls = situacao, dono, aberta, None, []
+        self.lista, self.codparc, self.abertas = lista, codparc, abertas or []
+        self.vals = []
 
     def execute(self, sql, vals=None):
         self.sqls.append(sql)
+        self.vals.append(vals)
         if "FROM chamada WHERE id = %s FOR UPDATE" in sql:
-            self.r = [(1, 11842, self.dono, self.situacao, None)]
+            contato = 8 if self.codparc is None else None
+            self.r = [(1, self.codparc, self.dono, self.situacao, None, self.lista, contato)]
+        elif "ORDER BY inicio" in sql and "situacao = 'ABERTA'" in sql:  # recebida: todas as abertas
+            self.r = self.abertas
+        elif "FROM assunto WHERE id" in sql:
+            self.r = [(1,)] if vals[0] == 3 else []
+        elif "RETURNING expira" in sql:
+            self.r = [(None,)]
         elif "situacao = 'ABERTA' AND expira > now()" in sql:
             self.r = [self.aberta] if self.aberta else []
         elif "FROM parametro" in sql:
@@ -38,6 +48,9 @@ class Pg:
 
     def fetchone(self):
         return self.r[0] if self.r else None
+
+    def fetchall(self):
+        return self.r
 
 
 class Ora:
@@ -100,6 +113,36 @@ chk("trava pega o advisory lock ANTES de olhar", "pg_advisory_xact_lock" in pg.s
 pg = Pg(aberta=(5, 25, "RAFAEL", None, None))
 chk("aberto por mim = retoma a mesma ligação", C.iniciar(pg, 11842, "INTERNA", OP, None, None) == {"id": 5, "inicio": None, "expiraEm": None, "retomada": True})
 chk("cliente livre = nova ligação", C.iniciar(Pg(), 11842, "INTERNA", OP, None, None)["id"] == 99)
+
+# ---- Recebidas ----
+r = C.iniciar_recebida(Pg(abertas=[(5, 7, "PEDRO", None, None, "CARTEIRA")]), 11842, None, OP, 41, 30)
+chk("recebida com cliente aberto por outro abre mesmo assim, com aviso", r["id"] == 99 and r["emChamada"]["nomeUsu"] == "PEDRO")
+r = C.iniciar_recebida(Pg(abertas=[(5, 25, "RAFAEL", None, None, "RECEBIDA")]), 11842, None, OP, 41, 30)
+chk("recebida aberta por mim = retoma", r["id"] == 5 and r["retomada"])
+pg = Pg()
+C.iniciar_recebida(pg, None, 8, OP, None, None)
+chk("recebida de contato não pega advisory lock (não tem codparc)", not any("pg_advisory" in x for x in pg.sqls))
+ins = [v for x, v in zip(pg.sqls, pg.vals) if "INSERT INTO chamada" in x][0]
+chk("recebida de contato grava contato_id e lista RECEBIDA", ins[0] is None and ins[1] == 8)
+
+pg = Pg(lista="RECEBIDA")
+C.renovar(pg, 1, OP)
+chk("renovar recebida só estica, sem conferir trava de outro", not any("pg_advisory" in x for x in pg.sqls))
+
+chk("finalizar recebida sem assunto = 400", erro(lambda: C.finalizar(Pg(lista="RECEBIDA"), ora, 1, OP, {}), C.Invalido))
+chk("finalizar recebida com assunto inativo = 400", erro(lambda: C.finalizar(Pg(lista="RECEBIDA"), ora, 1, OP, {"assuntoId": 4}), C.Invalido))
+pg = Pg(lista="RECEBIDA")
+C.finalizar(pg, ora, 1, OP, {"assuntoId": 3, "resultado": "NAO_ATENDEU", "desfecho": "VENDA"})
+upd = [v for x, v in zip(pg.sqls, pg.vals) if "SET situacao = 'FINALIZADA'" in x][0]
+chk("finalizar recebida força ATENDEU e grava o assunto", upd[0] == "ATENDEU" and upd[1] == "VENDA" and upd[-2] == 3)
+pg = Pg(lista="CARTEIRA")
+C.finalizar(pg, ora, 1, OP, {"resultado": "ATENDEU", "assuntoId": 3})
+upd = [v for x, v in zip(pg.sqls, pg.vals) if "SET situacao = 'FINALIZADA'" in x][0]
+chk("ligação feita ignora assunto", upd[-2] is None)
+chk(
+    "contato sem cadastro não aceita nota",
+    erro(lambda: C.finalizar(Pg(lista="RECEBIDA", codparc=None), ora, 1, OP, {"assuntoId": 3, "notas": [{"nunota": 500, "tipo": "PEDIDO"}]}), C.Invalido),
+)
 
 print("TUDO OK" if ok else "HOUVE FALHA")
 sys.exit(0 if ok else 1)
