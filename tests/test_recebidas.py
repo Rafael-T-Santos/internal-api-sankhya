@@ -158,6 +158,41 @@ chk("Receita preenche nome, cidade, UF e telefone", d["nome"] == "LOJA NOVA LTDA
 chk("Receita sem estabelecimento não quebra", R.dados_receita({"razao_social": "X"})["cidade"] is None)
 
 
+# ---- Meu dia: recebidas à parte ----
+import televendas_extras as X  # noqa: E402
+from datetime import date as _date, datetime as _dt  # noqa: E402
+
+
+class PgDia:
+    def __init__(self):
+        self.sqls, self.r = [], []
+
+    def execute(self, sql, vals=None):
+        self.sqls.append(sql)
+        if "count(DISTINCT inicio::date)" in sql:
+            self.r = [(5, 3, 1, 1, 40, 25, 6, 4, 5, 8, 2, 9)]
+        elif "to_char(now()" in sql:
+            self.r = [("202610", _date(2026, 10, 17))]
+        elif "FROM meta" in sql:
+            self.r = [(30, None, None)]
+        elif "LEFT JOIN contato k" in sql:
+            self.r = [(1, None, _dt(2026, 10, 17, 10, 0), "ATENDEU", None, "RECEBIDA", 7, "LOJA NOVA")]
+        else:
+            self.r = []
+
+    def fetchone(self):
+        return self.r[0] if self.r else None
+
+    def fetchall(self):
+        return self.r
+
+
+pgd = PgDia()
+d = X.meu_dia(pgd, 25)
+chk("meu dia: ligações (meta) contam só as feitas", "inicio::date = current_date AND lista <> 'RECEBIDA')" in pgd.sqls[0])
+chk("meu dia: recebidas de hoje e do mês à parte", d["dia"]["recebidas"] == 2 and d["mes"]["recebidas"] == 9 and d["dia"]["ligacoes"] == 5)
+chk("meu dia: ligação de contato traz o nome dele", d["ligacoesHoje"][0]["contatoId"] == 7 and d["ligacoesHoje"][0]["nomeContato"] == "LOJA NOVA")
+
 # ---- Rotas ----
 class CurOraSessao:
     def execute(self, sql, binds=None):

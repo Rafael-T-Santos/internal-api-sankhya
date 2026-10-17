@@ -1005,12 +1005,13 @@ def gerencia_ao_vivo():
 @bp.route("/api/televendas/gerencia/indicadores", methods=["GET"])
 @exige_televendas(gerente=True)
 def gerencia_indicadores():
-    """?de=AAAA-MM-DD&ate=AAAA-MM-DD&codUsu=&lista=CARTEIRA|INTERNA (de e ate obrigatórios).
+    """?de=AAAA-MM-DD&ate=AAAA-MM-DD&codUsu=&lista=CARTEIRA|INTERNA|RECEBIDA (de e ate obrigatórios).
 
-    Produtividade por operador e por dia, resultados, desfechos e ranking dos
-    motivos de não compra. Só Postgres.
+    Produtividade por operador e por dia (feitas e recebidas à parte), resultados,
+    desfechos, motivos de não compra e assuntos das recebidas. O Oracle só diz o
+    vendedor de cada operador (recebidas de outra carteira).
     """
     def fazer(pg, ora):
-        return gerencia.indicadores(pg, *gerencia.filtros(request.args))
+        return gerencia.indicadores(pg, *gerencia.filtros(request.args), cur_ora=ora)
 
-    return _ligacao(fazer)
+    return _ligacao(fazer, precisa_oracle=True)
