@@ -56,6 +56,26 @@ SQL_REPRESENTANTES = """
      ORDER BY V.APELIDO
 """
 
+# Operadores ativos do televendas que têm carteira, para o gerente escolher qual
+# abrir. O vendedor segue a mesma regra da sessão (televendas.SQL_VENDEDOR):
+# MIN(CODVEND) ativo do usuário em TGFVEN e, na falta, TSIUSU.CODVEND.
+# Operador sem vendedor fica de fora: não tem carteira para abrir.
+SQL_OPERADORES_CARTEIRA = """
+    SELECT X.CODUSU, X.NOMEUSU, V.CODVEND, V.APELIDO
+      FROM (SELECT P.CODUSU, U.NOMEUSU,
+                   NVL((SELECT MIN(T.CODVEND)
+                          FROM TGFVEN T
+                         WHERE T.CODUSU = P.CODUSU
+                           AND T.ATIVO = 'S'),
+                       NULLIF(U.CODVEND, 0)) AS CODVEND
+              FROM AD_PERFILTVL P
+              JOIN TSIUSU U ON U.CODUSU = P.CODUSU
+             WHERE UPPER(TRIM(P.PERFIL)) = 'OPERADOR'
+               AND NVL(P.ATIVO, 'N') = 'S') X
+      JOIN TGFVEN V ON V.CODVEND = X.CODVEND
+     ORDER BY X.NOMEUSU
+"""
+
 SQL_BUSCA_CIDADE = """
     SELECT * FROM (
         SELECT CID.CODCID, CID.NOMECID, UFS.UF
@@ -200,6 +220,19 @@ def representantes(cur_ora):
             "codTelevend": int(r[2]),
             "televendas": _txt(r[3]),
             "ativo": r[4] == "S",
+        }
+        for r in cur_ora.fetchall()
+    ]
+
+
+def operadores_carteira(cur_ora):
+    cur_ora.execute(SQL_OPERADORES_CARTEIRA)
+    return [
+        {
+            "codUsu": int(r[0]),
+            "nomeUsu": _txt(r[1]),
+            "codVend": int(r[2]),
+            "apelidoVend": _txt(r[3]),
         }
         for r in cur_ora.fetchall()
     ]

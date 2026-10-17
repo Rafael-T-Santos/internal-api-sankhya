@@ -22,7 +22,9 @@ class CurOra:
         self.r = []
 
     def execute(self, sql, binds=None):
-        if "AD_PERFILTVL" in sql:
+        if "SQL_OPERADORES_CARTEIRA" in estado and "'OPERADOR'" in sql:
+            self.r = estado["SQL_OPERADORES_CARTEIRA"]
+        elif "AD_PERFILTVL" in sql:
             self.r = [(estado["perfil"], "S")]
         elif "TGFVEN T" in sql:  # vendedor do usuário (sessão)
             self.r = [(41, "ANA")]
@@ -135,6 +137,18 @@ chk("com outra TOP restando -> 200", r.status_code == 200)
 chk("parâmetro fora da faixa -> 400", c.put("/api/televendas/config/parametros/TRAVA_MINUTOS", headers=H, json={"valor": 1}).status_code == 400)
 chk("parâmetro desconhecido -> 400", c.put("/api/televendas/config/parametros/OUTRO", headers=H, json={"valor": 1}).status_code == 400)
 chk("parâmetro válido -> 200", c.put("/api/televendas/config/parametros/JANELA_ATRIBUICAO_DIAS", headers=H, json={"valor": 5}).status_code == 200)
+
+estado["SQL_OPERADORES_CARTEIRA"] = [(31, "MARIA SILVA ", 41, "MARIA"), (32, "JOAO", 52, None)]
+r = c.get("/api/televendas/config/operadores-carteira", headers=H)
+chk(
+    "lista operadores com carteira (código do vendedor + nome)",
+    r.status_code == 200
+    and r.json["dados"][0] == {"codUsu": 31, "nomeUsu": "MARIA SILVA", "codVend": 41, "apelidoVend": "MARIA"}
+    and r.json["dados"][1]["apelidoVend"] is None,
+)
+estado["perfil"] = "OPERADOR"
+chk("operador não lista as carteiras (403)", c.get("/api/televendas/config/operadores-carteira", headers=H).status_code == 403)
+estado["perfil"] = "GERENTE"
 
 print("TUDO OK" if ok else "HOUVE FALHA")
 sys.exit(0 if ok else 1)

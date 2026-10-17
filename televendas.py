@@ -385,6 +385,14 @@ def config_representantes():
     return _config(lambda pg, ora, quem: {"dados": tvconfig.representantes(ora)})
 
 
+@bp.route("/api/televendas/config/operadores-carteira", methods=["GET"])
+@exige_televendas(gerente=True)
+def config_operadores_carteira():
+    """Operadores ativos com carteira (código do vendedor + nome), para o gerente
+    escolher qual carteira abrir sem precisar saber o código de cada um."""
+    return _config(lambda pg, ora, quem: {"dados": tvconfig.operadores_carteira(ora)})
+
+
 @bp.route("/api/televendas/config/locais", methods=["GET"])
 @exige_televendas(gerente=True)
 def config_locais():
