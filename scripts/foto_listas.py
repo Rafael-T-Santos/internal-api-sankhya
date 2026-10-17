@@ -11,6 +11,10 @@ enriquecimento. Rodar uma vez por dia, de manhã (cron no host):
 
 (10:00 UTC = 07:00 em Maceió, de segunda a sábado.) Rodar de novo no mesmo dia
 não duplica: a foto do dia é refeita do zero, numa transação.
+
+Depois da foto, liga ao cadastro os contatos sem cadastro (ligações recebidas)
+cujo CNPJ/CPF já apareceu no Sankhya. Em transação própria: se falhar, a foto
+do dia continua gravada.
 """
 
 import os
@@ -21,6 +25,7 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 
 import televendas_listas as L  # noqa: E402
+import televendas_recebidas as R  # noqa: E402
 from db import conectar_oracle  # noqa: E402
 from pg import conectar_postgres  # noqa: E402
 
@@ -67,6 +72,16 @@ def main():
             f"({sum(1 for l in linhas if l[0] == 'CARTEIRA' and l[4])} liberados), {len(internos)} na fila interna "
             f"— {(datetime.now() - inicio).seconds}s"
         )
+
+        try:
+            with pg:
+                r = R.ligar_pendentes(pg.cursor(), ora.cursor())
+            print(
+                f"{datetime.now():%Y-%m-%d %H:%M} contatos sem cadastro: {r['ligados']} ligado(s) ao cadastro, "
+                f"{r['repetidos']} com documento repetido no Sankhya, {r['pendentes']} ainda pendente(s)"
+            )
+        except Exception as err:  # noqa: BLE001 - a foto já foi gravada; só registra no log
+            print(f"{datetime.now():%Y-%m-%d %H:%M} contatos sem cadastro: falhou ({err})")
     finally:
         ora.close()
         pg.close()

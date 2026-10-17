@@ -449,14 +449,38 @@ def conferir_contato(cur_pg, cur_ora, id_):
     return {"ligado": True, "codParc": achados[0]}
 
 
+SQL_DOCUMENTOS = """SELECT REGEXP_REPLACE(CGC_CPF, '[^0-9]', ''), CODPARC FROM TGFPAR
+                      WHERE REGEXP_REPLACE(CGC_CPF, '[^0-9]', '') IN ({docs})"""
+
+
 def ligar_pendentes(cur_pg, cur_ora):
-    """Roda a conferência em todos os contatos pendentes com documento. Devolve quantos ligou."""
-    cur_pg.execute("SELECT id FROM contato WHERE codparc IS NULL AND documento IS NOT NULL")
-    n = 0
-    for (id_,) in cur_pg.fetchall():
-        if conferir_contato(cur_pg, cur_ora, id_)["ligado"]:
-            n += 1
-    return n
+    """Liga ao cadastro todo contato pendente cujo CNPJ/CPF já está no Sankhya.
+
+    Uma consulta ao Oracle por lote (não uma por contato): roda todo dia no
+    scripts/foto_listas.py e no botão "Conferir todos". Documento com mais de um
+    cadastro fica pendente, para a gerência ligar à mão.
+    Devolve {ligados, repetidos, pendentes}.
+    """
+    cur_pg.execute("SELECT id, documento FROM contato WHERE codparc IS NULL AND documento IS NOT NULL")
+    pendentes = cur_pg.fetchall()
+    por_doc = {}
+    docs = sorted({d for _, d in pendentes})
+    for i in range(0, len(docs), 900):
+        lote = docs[i:i + 900]
+        nomes = [f"D{j}" for j in range(len(lote))]
+        cur_ora.execute(SQL_DOCUMENTOS.format(docs=", ".join(f":{n}" for n in nomes)), dict(zip(nomes, lote)))
+        for doc, cod in cur_ora.fetchall():
+            por_doc.setdefault(doc, set()).add(int(cod))
+    ligados = repetidos = 0
+    for id_, doc in pendentes:
+        achados = por_doc.get(doc, set())
+        if len(achados) == 1:
+            ligar_contato(cur_pg, id_, next(iter(achados)), "AUTO")
+            ligados += 1
+        elif len(achados) > 1:
+            repetidos += 1
+    cur_pg.execute("SELECT count(*) FROM contato WHERE codparc IS NULL")
+    return {"ligados": ligados, "repetidos": repetidos, "pendentes": cur_pg.fetchone()[0]}
 
 
 # ---------------------------------------------------------------------------

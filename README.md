@@ -1355,7 +1355,7 @@ Motivos de não compra (só gerente): `GET/POST /config/motivos`, `PUT /config/m
 
 | Rotina | Quando | O quê |
 |---|---|---|
-| `scripts/foto_listas.py` | seg–sáb 10:00 UTC (07:00 Maceió) | Foto do dia das listas em `televendas.foto_dia` / `foto_lista`: quem estava em cada carteira (com representante e liberação da escala) e na fila interna. Base da positivação da Fase 4. Rodar de novo no mesmo dia refaz a foto |
+| `scripts/foto_listas.py` | seg–sáb 10:00 UTC (07:00 Maceió) | Foto do dia das listas em `televendas.foto_dia` / `foto_lista`: quem estava em cada carteira (com representante e liberação da escala) e na fila interna. Base da positivação da Fase 4. Rodar de novo no mesmo dia refaz a foto. Depois, liga ao cadastro os contatos sem cadastro (ligações recebidas) cujo CNPJ/CPF já apareceu no Sankhya |
 
 `televendas.conversao` (migração 004) fica vazia até a Fase 4: guarda cada nota atribuída a uma ligação (MANUAL = NUNOTA informado; AUTO = cálculo por `AD_CODVENDINT` + janela), uma vez por nota.
 
