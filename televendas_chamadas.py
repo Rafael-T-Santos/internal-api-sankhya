@@ -149,17 +149,59 @@ def iniciar(cur_pg, codparc, lista, op, codvend, codvend_ext):
     return {"id": id_, "inicio": _iso(inicio), "expiraEm": _iso(expira), "retomada": False}
 
 
+def iniciar_recebida(cur_pg, codparc, contato_id, op, codvend, codvend_ext):
+    """Abre uma ligação RECEBIDA, de um cliente (codparc) ou de um contato sem cadastro.
+
+    Diferente da feita: não passa pela elegibilidade e não é barrada por outro
+    operador com o cliente aberto (o cliente já está na linha). A ligação aberta
+    também reserva o cliente, para ninguém ligar para ele enquanto isso. Recebida
+    aberta pelo MESMO operador para o mesmo cliente é retomada (F5).
+    """
+    if codparc is not None:
+        cur_pg.execute("SELECT pg_advisory_xact_lock(%s, %s)", (LOCK_NS, codparc))
+        filtro, chave = "codparc = %s", codparc
+    else:
+        filtro, chave = "contato_id = %s AND codparc IS NULL", contato_id
+    cur_pg.execute(
+        f"""SELECT id, codusu, nome_usu, inicio, expira, lista FROM chamada
+             WHERE {filtro} AND situacao = 'ABERTA' AND expira > now()
+             ORDER BY inicio""",
+        (chave,),
+    )
+    abertas = cur_pg.fetchall()
+    for a in abertas:
+        if a[1] == op["codUsu"] and a[5] == "RECEBIDA":
+            return {"id": a[0], "inicio": _iso(a[3]), "expiraEm": _iso(a[4]), "retomada": True, "emChamada": None}
+    outra = next((a for a in abertas if a[1] != op["codUsu"]), None)
+    cur_pg.execute(
+        """INSERT INTO chamada (codparc, contato_id, lista, codusu, nome_usu, codvend, codvend_ext, expira)
+           VALUES (%s, %s, 'RECEBIDA', %s, %s, %s, %s, now() + make_interval(mins => %s))
+           RETURNING id, inicio, expira""",
+        (codparc, contato_id, op["codUsu"], op["nomeUsu"], codvend, codvend_ext, trava_minutos(cur_pg)),
+    )
+    id_, inicio, expira = cur_pg.fetchone()
+    return {
+        "id": id_,
+        "inicio": _iso(inicio),
+        "expiraEm": _iso(expira),
+        "retomada": False,
+        # Aviso, não bloqueio: outro operador estava com este cliente aberto.
+        "emChamada": _trava(outra) if outra else None,
+    }
+
+
 def _minha(cur_pg, id_, op):
     """A chamada (travada para atualização), conferindo que é do operador."""
     cur_pg.execute(
-        "SELECT id, codparc, codusu, situacao, expira FROM chamada WHERE id = %s FOR UPDATE", (id_,)
+        "SELECT id, codparc, codusu, situacao, expira, lista, contato_id FROM chamada WHERE id = %s FOR UPDATE",
+        (id_,),
     )
     r = cur_pg.fetchone()
     if not r:
         raise NaoEncontrado(f"Ligação {id_} não existe.")
     if r[2] != op["codUsu"]:
         raise Proibido("Esta ligação é de outro operador.")
-    return {"id": r[0], "codparc": r[1], "situacao": r[3], "expira": r[4]}
+    return {"id": r[0], "codparc": r[1], "situacao": r[3], "expira": r[4], "lista": r[5], "contato_id": r[6]}
 
 
 def renovar(cur_pg, id_, op):
@@ -168,6 +210,13 @@ def renovar(cur_pg, id_, op):
     ch = _minha(cur_pg, id_, op)
     if ch["situacao"] != "ABERTA":
         raise Conflito("A ligação já foi encerrada.")
+    if ch["lista"] == "RECEBIDA":
+        # O cliente está na linha: a reserva só se estica, nunca é tomada.
+        cur_pg.execute(
+            "UPDATE chamada SET expira = now() + make_interval(mins => %s) WHERE id = %s RETURNING expira",
+            (trava_minutos(cur_pg), id_),
+        )
+        return {"expiraEm": _iso(cur_pg.fetchone()[0])}
     cur_pg.execute("SELECT pg_advisory_xact_lock(%s, %s)", (LOCK_NS, ch["codparc"]))
     cur_pg.execute(
         """SELECT id, codusu, nome_usu, inicio, expira FROM chamada
@@ -257,7 +306,18 @@ def finalizar(cur_pg, cur_ora, id_, op, dados):
     if ch["situacao"] == "CANCELADA":
         raise Conflito("Esta ligação foi descartada; inicie outra para registrar.")
 
-    resultado = dados.get("resultado")
+    recebida = ch["lista"] == "RECEBIDA"
+    # Na recebida o cliente ligou: atendeu sempre. O assunto é obrigatório.
+    resultado = "ATENDEU" if recebida else dados.get("resultado")
+    assunto_id = dados.get("assuntoId") or None
+    if recebida:
+        if assunto_id is None:
+            raise Invalido("Escolha o assunto da ligação.")
+        cur_pg.execute("SELECT 1 FROM assunto WHERE id = %s AND ativo", (assunto_id,))
+        if not cur_pg.fetchone():
+            raise Invalido("Assunto inválido.")
+    else:
+        assunto_id = None
     if resultado not in RESULTADOS:
         raise Invalido("Escolha o resultado da ligação.")
     desfecho = dados.get("desfecho") or None
@@ -272,12 +332,14 @@ def finalizar(cur_pg, cur_ora, id_, op, dados):
         if not cur_pg.fetchone():
             raise Invalido("Motivo de não compra inválido.")
 
+    if dados.get("notas") and ch["codparc"] is None:
+        raise Invalido("Contato sem cadastro não tem nota no Sankhya para vincular.")
     notas = _validar_notas(cur_ora, ch["codparc"], dados.get("notas"))
 
     cur_pg.execute(
         """UPDATE chamada
               SET situacao = 'FINALIZADA', fim = now(), resultado = %s, desfecho = %s, motivo_id = %s,
-                  retorno_em = %s::timestamptz, telefone = %s, contato = %s, obs = %s
+                  retorno_em = %s::timestamptz, telefone = %s, contato = %s, obs = %s, assunto_id = %s
             WHERE id = %s
         RETURNING inicio, fim""",
         (
@@ -288,6 +350,7 @@ def finalizar(cur_pg, cur_ora, id_, op, dados):
             _texto(dados, "telefone", 40),
             _texto(dados, "contato", 100),
             _texto(dados, "obs", 4000),
+            assunto_id,
             id_,
         ),
     )
@@ -297,7 +360,7 @@ def finalizar(cur_pg, cur_ora, id_, op, dados):
             "INSERT INTO chamada_nota (chamada_id, nunota, tipo) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
             (id_, nunota, tipo),
         )
-    return {"id": id_, "codParc": ch["codparc"], "inicio": _iso(inicio), "fim": _iso(fim)}
+    return {"id": id_, "codParc": ch["codparc"], "contatoId": ch["contato_id"], "inicio": _iso(inicio), "fim": _iso(fim)}
 
 
 def gravar_anexo(cur_pg, id_, op, descricao, url):
@@ -316,22 +379,24 @@ def gravar_anexo(cur_pg, id_, op, descricao, url):
 # ---------------------------------------------------------------------------
 
 
-def historico(cur_pg, codparc, limite=100):
-    """Ligações REGISTRADAS do cliente, da mais nova para a mais antiga, com notas e anexos."""
-    cur_pg.execute(
-        """SELECT c.id, c.lista, c.codusu, c.nome_usu, c.inicio, c.fim, c.resultado, c.desfecho,
-                  m.descricao, c.retorno_em, c.telefone, c.contato, c.obs,
-                  COALESCE((SELECT json_agg(json_build_object('nunota', n.nunota, 'tipo', n.tipo) ORDER BY n.id)
-                              FROM chamada_nota n WHERE n.chamada_id = c.id), '[]'),
-                  COALESCE((SELECT json_agg(json_build_object('descricao', a.descricao, 'url', a.url) ORDER BY a.id)
-                              FROM anexo a WHERE a.chamada_id = c.id), '[]')
-             FROM chamada c
-             LEFT JOIN motivo m ON m.id = c.motivo_id
-            WHERE c.codparc = %s AND c.situacao = 'FINALIZADA'
-            ORDER BY c.inicio DESC
-            LIMIT %s""",
-        (codparc, limite),
-    )
+_SQL_HISTORICO = """
+    SELECT c.id, c.lista, c.codusu, c.nome_usu, c.inicio, c.fim, c.resultado, c.desfecho,
+           m.descricao, c.retorno_em, c.telefone, c.contato, c.obs,
+           COALESCE((SELECT json_agg(json_build_object('nunota', n.nunota, 'tipo', n.tipo) ORDER BY n.id)
+                       FROM chamada_nota n WHERE n.chamada_id = c.id), '[]'),
+           COALESCE((SELECT json_agg(json_build_object('descricao', a.descricao, 'url', a.url) ORDER BY a.id)
+                       FROM anexo a WHERE a.chamada_id = c.id), '[]'),
+           s.descricao, c.contato_id
+      FROM chamada c
+      LEFT JOIN motivo m ON m.id = c.motivo_id
+      LEFT JOIN assunto s ON s.id = c.assunto_id
+     WHERE {filtro} AND c.situacao = 'FINALIZADA'
+     ORDER BY c.inicio DESC
+     LIMIT %s"""
+
+
+def _historico(cur_pg, filtro, valor, limite):
+    cur_pg.execute(_SQL_HISTORICO.format(filtro=filtro), (valor, limite))
     return [
         {
             "id": r[0],
@@ -349,9 +414,21 @@ def historico(cur_pg, codparc, limite=100):
             "obs": r[12],
             "notas": r[13],
             "anexos": r[14],
+            "assunto": r[15],
+            "contatoId": r[16],
         }
         for r in cur_pg.fetchall()
     ]
+
+
+def historico(cur_pg, codparc, limite=100):
+    """Ligações REGISTRADAS do cliente, da mais nova para a mais antiga, com notas e anexos.
+    Inclui as recebidas de quando ele ainda era contato sem cadastro (já ligadas)."""
+    return _historico(cur_pg, "c.codparc = %s", codparc, limite)
+
+
+def historico_contato(cur_pg, contato_id, limite=100):
+    return _historico(cur_pg, "c.contato_id = %s", contato_id, limite)
 
 
 def agenda(cur_pg, codusu, de, ate):
@@ -362,6 +439,7 @@ def agenda(cur_pg, codusu, de, ate):
         """SELECT c.id, c.codparc, c.retorno_em, c.resultado, c.desfecho, c.obs, c.lista
              FROM chamada c
             WHERE c.codusu = %s AND c.situacao = 'FINALIZADA' AND c.retorno_em IS NOT NULL
+              AND c.codparc IS NOT NULL
               AND c.retorno_em::date BETWEEN %s AND %s
               AND NOT EXISTS (SELECT 1 FROM chamada d
                                WHERE d.codparc = c.codparc AND d.situacao = 'FINALIZADA' AND d.inicio > c.inicio)
@@ -386,7 +464,7 @@ def travas(cur_pg):
     """Todas as ligações abertas agora (são poucas): o app consulta a cada 30 s."""
     cur_pg.execute(
         """SELECT codparc, codusu, nome_usu, inicio, expira FROM chamada
-            WHERE situacao = 'ABERTA' AND expira > now() ORDER BY inicio"""
+            WHERE situacao = 'ABERTA' AND expira > now() AND codparc IS NOT NULL ORDER BY inicio"""
     )
     return [{"codParc": r[0], **_trava(r)} for r in cur_pg.fetchall()]
 

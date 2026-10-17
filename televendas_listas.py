@@ -326,6 +326,35 @@ def liberado(dia_visita, dia_semana):
     return dia_visita is not None and 2 <= dia_semana <= 6 and dia_visita < dia_semana
 
 
+def linha_cliente(r, hoje):
+    """Uma linha da consulta das listas (_RESTO) no formato que o app usa."""
+    ultima = r[14].date() if isinstance(r[14], datetime) else r[14]
+    return {
+        "codParc": int(r[0]),
+        "fantasia": _txt(r[1]),
+        "razaoSocial": _txt(r[2]),
+        "cgcCpf": _txt(r[3]),
+        "codParcMatriz": int(r[4]) if r[4] is not None else None,
+        "parceiroMatriz": _txt(r[5]),
+        "codCid": int(r[6]) if r[6] is not None else None,
+        "cidade": _txt(r[7]),
+        "codBai": int(r[8]) if r[8] is not None else None,
+        "bairro": _txt(r[9]),
+        "telefone": _txt(r[10]),
+        "observacoes": _txt(r[11]),
+        "codVendExterno": int(r[12]) if r[12] is not None else None,
+        "vendedor": _txt(r[13]),
+        "ultimaCompra": _data(ultima),
+        "diasSemCompra": (hoje - ultima).days if ultima else None,
+        "diasAtraso": int(r[15] or 0),
+        "vlrAtrasado": float(r[16] or 0),
+        "ultimaOrdemCarga": int(r[17]) if r[17] else None,
+        "dataOrdemCarga": _data(r[18]),
+        "horaSaidaOrdem": _hora(r[19]),
+        "contatos": [],
+    }
+
+
 def buscar_clientes(cur_ora, lista, config, codtelevend=None, so_clientes=True):
     """Executa a consulta da lista no Oracle e devolve (hoje, dia_semana, [clientes])."""
     cur_ora.execute(SQL_HOJE)
@@ -338,35 +367,7 @@ def buscar_clientes(cur_ora, lista, config, codtelevend=None, so_clientes=True):
         binds["CODTELEVEND"] = codtelevend
     cur_ora.execute(sql_lista(lista, so_clientes).replace("{tops}", tops_sql), binds)
 
-    clientes = []
-    for r in cur_ora.fetchall():
-        ultima = r[14].date() if isinstance(r[14], datetime) else r[14]
-        clientes.append(
-            {
-                "codParc": int(r[0]),
-                "fantasia": _txt(r[1]),
-                "razaoSocial": _txt(r[2]),
-                "cgcCpf": _txt(r[3]),
-                "codParcMatriz": int(r[4]) if r[4] is not None else None,
-                "parceiroMatriz": _txt(r[5]),
-                "codCid": int(r[6]) if r[6] is not None else None,
-                "cidade": _txt(r[7]),
-                "codBai": int(r[8]) if r[8] is not None else None,
-                "bairro": _txt(r[9]),
-                "telefone": _txt(r[10]),
-                "observacoes": _txt(r[11]),
-                "codVendExterno": int(r[12]) if r[12] is not None else None,
-                "vendedor": _txt(r[13]),
-                "ultimaCompra": _data(ultima),
-                "diasSemCompra": (hoje - ultima).days if ultima else None,
-                "diasAtraso": int(r[15] or 0),
-                "vlrAtrasado": float(r[16] or 0),
-                "ultimaOrdemCarga": int(r[17]) if r[17] else None,
-                "dataOrdemCarga": _data(r[18]),
-                "horaSaidaOrdem": _hora(r[19]),
-                "contatos": [],
-            }
-        )
+    clientes = [linha_cliente(r, hoje) for r in cur_ora.fetchall()]
     return hoje, int(dia_semana), clientes
 
 
