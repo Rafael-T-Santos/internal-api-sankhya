@@ -211,6 +211,116 @@ def alterar_escala(cur_pg, id_, dados, quem):
     return cur_pg.rowcount
 
 
+LOTE_MAX = 2000
+
+
+def _ja_tem_local(cur_pg, codvend, tipo, codcid, codbai):
+    """Dia da linha ATIVA do representante para esse local, ou None."""
+    col, codigo = ("codcid", codcid) if tipo == "C" else ("codbai", codbai)
+    cur_pg.execute(
+        f"SELECT dia_visita FROM escala WHERE ativo AND codvend = %s AND tipo_local = %s AND {col} = %s",
+        (codvend, tipo, codigo),
+    )
+    ja = cur_pg.fetchone()
+    return ja[0] if ja else None
+
+
+def escala_em_lote(cur_pg, cur_ora, dados, quem):
+    """Mesma mudança em várias linhas da escala, numa transação só.
+
+    acao:
+      transferir  {codVend}    linhas ativas passam para outro representante, no
+                               mesmo dia. A antiga é DESATIVADA e nasce uma nova,
+                               para o histórico de quem visitava ficar.
+      dia         {diaVisita}  muda o dia das linhas ativas.
+      desativar / reativar
+    Linha que não dá para mudar (inativa, já é do destino, local repetido) é
+    pulada e volta em `ignoradas` com o motivo; o resto é gravado.
+    """
+    acao = dados.get("acao")
+    if acao not in ("transferir", "dia", "desativar", "reativar"):
+        raise Invalido("acao é transferir, dia, desativar ou reativar.")
+    ids = dados.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise Invalido("Escolha pelo menos uma linha (ids).")
+    try:
+        ids = sorted({int(i) for i in ids})
+    except (TypeError, ValueError):
+        raise Invalido("ids precisa ser uma lista de números.")
+    if len(ids) > LOTE_MAX:
+        raise Invalido(f"No máximo {LOTE_MAX} linhas por vez.")
+
+    destino = dia = None
+    if acao == "transferir":
+        destino = _int(dados, "codVend")
+        _existe(cur_ora, SQL_VEND, destino, f"Vendedor {destino} não existe no Sankhya.")
+    if acao == "dia":
+        dia = _int(dados, "diaVisita")
+        if dia not in DIAS:
+            raise Invalido("diaVisita vai de 1 (segunda) a 5 (sexta).")
+
+    cur_pg.execute(
+        """SELECT id, codvend, dia_visita, tipo_local, codcid, codbai, ativo
+             FROM escala WHERE id = ANY(%s) ORDER BY id FOR UPDATE""",
+        (ids,),
+    )
+    linhas = cur_pg.fetchall()
+    faltam = sorted(set(ids) - {r[0] for r in linhas})
+    if faltam:
+        raise Invalido(f"Linha(s) {', '.join(map(str, faltam))} da escala não existem.")
+
+    feitas, ignoradas = 0, []
+
+    def pular(id_, motivo):
+        ignoradas.append({"id": id_, "motivo": motivo})
+
+    for id_, codvend, dia_atual, tipo, codcid, codbai, ativo in linhas:
+        if acao == "reativar":
+            if ativo:
+                pular(id_, "já está ativa")
+                continue
+            ja = _ja_tem_local(cur_pg, codvend, tipo, codcid, codbai)
+            if ja:
+                pular(id_, f"o representante já tem esse local ativo ({DIAS[ja]})")
+                continue
+            cur_pg.execute(
+                "UPDATE escala SET ativo = true, alterado_por = %s, alterado_em = now() WHERE id = %s", (quem, id_)
+            )
+        elif not ativo:
+            pular(id_, "está desativada")
+            continue
+        elif acao == "desativar":
+            cur_pg.execute(
+                "UPDATE escala SET ativo = false, alterado_por = %s, alterado_em = now() WHERE id = %s", (quem, id_)
+            )
+        elif acao == "dia":
+            if dia_atual == dia:
+                pular(id_, f"já é {DIAS[dia]}")
+                continue
+            cur_pg.execute(
+                "UPDATE escala SET dia_visita = %s, alterado_por = %s, alterado_em = now() WHERE id = %s",
+                (dia, quem, id_),
+            )
+        else:  # transferir
+            if codvend == destino:
+                pular(id_, "já é desse representante")
+                continue
+            ja = _ja_tem_local(cur_pg, destino, tipo, codcid, codbai)
+            if ja:
+                pular(id_, f"o destino já tem esse local ({DIAS[ja]})")
+                continue
+            cur_pg.execute(
+                "UPDATE escala SET ativo = false, alterado_por = %s, alterado_em = now() WHERE id = %s", (quem, id_)
+            )
+            cur_pg.execute(
+                """INSERT INTO escala (codvend, dia_visita, tipo_local, codcid, codbai, alterado_por, alterado_em)
+                   VALUES (%s, %s, %s, %s, %s, %s, now())""",
+                (destino, dia_atual, tipo, codcid, codbai, quem),
+            )
+        feitas += 1
+    return {"alteradas": feitas, "ignoradas": ignoradas}
+
+
 def representantes(cur_ora):
     cur_ora.execute(SQL_REPRESENTANTES)
     return [

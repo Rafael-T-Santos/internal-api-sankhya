@@ -61,7 +61,11 @@ class CurPg:
     def execute(self, sql, vals=None):
         estado["sqls"].append((sql, vals))
         if "SELECT dia_visita FROM escala" in sql:
-            self.r = []
+            # (codvend, codigo do local) -> dia já ativo
+            dia = estado.get("dup", {}).get((vals[0], vals[2]))
+            self.r = [(dia,)] if dia else []
+        elif "FOR UPDATE" in sql:
+            self.r = [r for r in estado.get("escala", []) if r[0] in vals[0]]
         elif "RETURNING id" in sql:
             self.r = [(77,)]
         elif "count(*) FROM top" in sql:
@@ -120,6 +124,46 @@ r = c.post("/api/televendas/config/escala", headers=H, json={"codVend": 34, "dia
 chk("dia fora de seg–sex -> 400", r.status_code == 400)
 r = c.put("/api/televendas/config/escala/5", headers=H, json={})
 chk("alteração vazia -> 400", r.status_code == 400)
+
+# --- escala em lote -------------------------------------------------------
+# (id, codvend, dia, tipo, codcid, codbai, ativo)
+estado["escala"] = [
+    (1, 23, 1, "C", 100, None, True),   # MESSIAS, segunda
+    (2, 23, 2, "C", 200, None, True),   # MESSIAS, terça — destino já tem a cidade 200
+    (3, 23, 3, "C", 300, None, False),  # desativada
+    (4, 58, 4, "B", None, 9, True),     # já é da CLAUDIA
+]
+estado["dup"] = {(58, 200): 3}
+lote = lambda corpo: c.post("/api/televendas/config/escala/lote", headers=H, json=corpo)  # noqa: E731
+
+estado["sqls"] = []
+r = lote({"acao": "transferir", "codVend": 58, "ids": [1, 2, 3, 4]})
+chk("transferir: só a linha que pode muda", r.status_code == 200 and r.json["alteradas"] == 1)
+motivos = {i["id"]: i["motivo"] for i in r.json["ignoradas"]}
+chk(
+    "transferir: pula repetida, desativada e a que já é do destino",
+    set(motivos) == {2, 3, 4} and "quarta" in motivos[2] and "desativada" in motivos[3],
+)
+ins = [v for s, v in estado["sqls"] if "INSERT INTO escala" in s]
+upd = [v for s, v in estado["sqls"] if "SET ativo = false" in s]
+chk("transferir: desativa a antiga e cria a nova no mesmo dia", upd == [("RAFAEL (25)", 1)] and ins == [(58, 1, "C", 100, None, "RAFAEL (25)")])
+
+chk("transferir para vendedor inexistente -> 400", lote({"acao": "transferir", "codVend": 999, "ids": [1]}).status_code == 400)
+chk("linha que não existe -> 400", lote({"acao": "desativar", "ids": [1, 50]}).status_code == 400)
+chk("sem ids -> 400", lote({"acao": "desativar", "ids": []}).status_code == 400)
+chk("ação desconhecida -> 400", lote({"acao": "apagar", "ids": [1]}).status_code == 400)
+chk("dia fora de seg–sex -> 400", lote({"acao": "dia", "diaVisita": 7, "ids": [1]}).status_code == 400)
+
+r = lote({"acao": "dia", "diaVisita": 2, "ids": [1, 2, 3]})
+chk("dia: muda só a ativa com dia diferente", r.status_code == 200 and r.json["alteradas"] == 1 and len(r.json["ignoradas"]) == 2)
+r = lote({"acao": "desativar", "ids": [1, 2, 3]})
+chk("desativar: ignora a já desativada", r.json["alteradas"] == 2 and r.json["ignoradas"][0]["id"] == 3)
+estado["dup"] = {(23, 300): 1}
+r = lote({"acao": "reativar", "ids": [1, 3]})
+chk("reativar: não cria local repetido", r.json["alteradas"] == 0 and {i["id"] for i in r.json["ignoradas"]} == {1, 3})
+estado["perfil"] = "OPERADOR"
+chk("operador não mexe em lote (403)", lote({"acao": "desativar", "ids": [1]}).status_code == 403)
+estado["perfil"] = "GERENTE"
 
 r = c.post("/api/televendas/config/tops", headers=H, json={"codTipOper": 9999})
 chk("TOP inexistente no Sankhya -> 400", r.status_code == 400)
