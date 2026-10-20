@@ -366,6 +366,15 @@ def config_escala_criar():
     return _config(lambda pg, ora, quem: {"id": tvconfig.criar_escala(pg, ora, corpo, quem)}, 201)
 
 
+@bp.route("/api/televendas/config/escala/lote", methods=["POST"])
+@exige_televendas(gerente=True)
+def config_escala_lote():
+    """{ids, acao: transferir {codVend} | dia {diaVisita} | desativar | reativar}
+    -> {alteradas, ignoradas: [{id, motivo}]}. Tudo numa transação."""
+    corpo = _corpo()
+    return _config(lambda pg, ora, quem: tvconfig.escala_em_lote(pg, ora, corpo, quem))
+
+
 @bp.route("/api/televendas/config/escala/<int:id_>", methods=["PUT"])
 @exige_televendas(gerente=True)
 def config_escala_alterar(id_):
